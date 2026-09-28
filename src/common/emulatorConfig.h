@@ -82,7 +82,7 @@ struct ConfigOptions {
 	// Guest shaders whose draws and dispatches are skipped: hex hashes, comma-separated.
 	std::string            skip_shader_hashes;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	bool red_zone_protection_enabled = false;
+	bool red_zone_protection_enabled = true;
 #endif
 	Keymap keymap;
 };
