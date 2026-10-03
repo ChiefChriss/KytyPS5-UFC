@@ -5,7 +5,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -58,6 +60,34 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
+	if ((m_graphics.checkpoints_enabled || m_graphics.buffer_markers_enabled) &&
+	    m_buffer != nullptr) {
+		// Checkpoints alone do not imply earlier work finished; serialize so the last
+		// bottom-of-pipe checkpoint bounds the hung command. Barriers are restricted
+		// inside dynamic rendering, so draws recorded there stay unserialized.
+		if (m_graphics.checkpoints_enabled && !m_rendering) {
+			vk::MemoryBarrier barrier {};
+			barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+			m_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                         vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0,
+			                         nullptr, 0, nullptr);
+		}
+		GpuCrashDiagnostics::CheckpointInfo info {};
+		info.op        = op;
+		info.submit_id = submit_id;
+		info.args[0]   = arg0;
+		info.args[1]   = arg1;
+		info.args[2]   = arg2;
+		info.args[3]   = arg3;
+		info.arg4      = arg4;
+		if (m_shaders != nullptr) {
+			info.ps_addr = m_shaders->GetPs().ps_regs.data_addr;
+			info.es_addr = m_shaders->GetVs().es_regs.data_addr;
+			info.gs_addr = m_shaders->GetVs().gs_regs.data_addr;
+		}
+		GpuCrashDiagnostics::RecordCheckpoint(m_graphics, m_buffer, info);
+	}
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {

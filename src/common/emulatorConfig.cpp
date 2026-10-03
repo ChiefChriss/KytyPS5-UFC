@@ -144,6 +144,14 @@ bool GpuAssistedValidationEnabled() {
 	return g_config->gpu_assisted_validation_enabled && g_config->vulkan_validation_enabled;
 }
 
+bool GpuCrashDiagnosticsEnabled() {
+	return g_config->gpu_crash_diagnostics_enabled;
+}
+
+bool GpuBreadcrumbsEnabled() {
+	return g_config->gpu_breadcrumbs_enabled;
+}
+
 bool RenderDocEnabled() {
 	return g_config->renderdoc_enabled;
 }

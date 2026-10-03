@@ -459,10 +459,14 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (base.atomic &&
 		    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
 		                   : format != Prospero::BufferFormat::k32UInt &&
-		                         format != Prospero::BufferFormat::k32Float)) {
+	                         format != Prospero::BufferFormat::k32SInt &&
+	                         format != Prospero::BufferFormat::k32Float)) {
 			return SpecializationFail(
-			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
-			                static_cast<uint32_t>(format)));
+			    fmt::format("atomic image descriptor {} uses unsupported format {}; descriptor: "
+			                "{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}", i,
+			                static_cast<uint32_t>(format), descriptor.dwords[0], descriptor.dwords[1],
+			                descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4],
+			                descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]));
 		}
 		const bool storage      = base.resource_class == ImageResourceClass::Storage;
 		image.fmask             = Prospero::IsFmaskTextureFormat(format);
@@ -478,8 +482,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
+		// Atomic operations use a raw U32 image view; signed min/max semantics are
+		// selected by the instruction opcode, not the descriptor's numeric class.
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
-		                              base.written && !base.read && !base.atomic;
+		                              (base.atomic || (base.written && !base.read));
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||

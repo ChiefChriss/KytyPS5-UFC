@@ -124,9 +124,7 @@ void RenderContext::PrepareBda() {
 		m_bda_logged = true;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges);
 	m_fault_process_pending = true;
 }
 

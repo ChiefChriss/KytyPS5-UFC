@@ -7,6 +7,7 @@
 #include "gameContent.h"
 #include "patchesDialog.h"
 #include "updateChecker.h"
+#include "kytyGitVersion.h"
 
 #include <QApplication>
 #include <QByteArray>
@@ -112,6 +113,10 @@ MainDialogPrivate::~MainDialogPrivate() {
 void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui = new Ui::MainDialog;
 	m_ui->setupUi(main_dialog);
+	main_dialog->setWindowTitle(
+	    QStringLiteral("KytyPS5 | %1%2 | Built %3 %4")
+	        .arg(QString::fromLatin1(KYTY_BUILD_ITERATION_LABEL), QString::fromLatin1(KYTY_GIT_HASH),
+	             QString::fromLatin1(__DATE__), QString::fromLatin1(__TIME__)));
 
 	m_main_dialog = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);

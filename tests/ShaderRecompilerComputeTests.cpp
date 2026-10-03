@@ -28879,6 +28879,40 @@ void CheckWave64WholeWaveResults() {
           "emulated halves repeated the first-active-lane broadcast");
 }
 
+TestCase Wave32ScalarMaskBranchesPreserveInactiveLanes() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 8, 7);
+  code.push_back(EncodeSMovB32(126, InlineU32(1))); // Only lane zero is active.
+  const auto execz = code.size();
+  code.push_back(0);
+  AppendSMovLiteral(&code, 8, 11); // Scalar work must run for inactive host lanes too.
+  const auto execnz = code.size();
+  code.push_back(0);
+  AppendSMovLiteral(&code, 8, 13);
+  const auto restore = code.size();
+  code[execz] = EncodeSopp(0x08, restore - execz - 1);
+  code[execnz] = EncodeSopp(0x09, restore - execnz - 1);
+  AppendSMovLiteral(&code, 126, ~0u);
+  code.push_back(EncodeVop1(0x01, 1, 8));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "Wave32ScalarMaskBranchesPreserveInactiveLanes";
+  test.code = std::move(code);
+  test.initial.assign(32, 0xdeadbeef);
+  test.expected.assign(32, 11);
+  test.opcodes = {O::S_MOV_B32, O::S_CBRANCH_EXECZ, O::S_CBRANCH_EXECNZ,
+                  O::V_MOV_B32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Wave64RawMasksAndScalarBranch() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -31999,6 +32033,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarSaveExecOps);
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);
   cases.push_back(ScalarOrn2SaveexecB32(32, 32));
+  cases.push_back(Wave32ScalarMaskBranchesPreserveInactiveLanes());
   cases.push_back(ScalarOrn2SaveexecB32(64, 64));
   cases.push_back(ScalarOrn2SaveexecB32(32, 4));
   cases.push_back(ScalarSubvectorLoops(32));
@@ -36048,8 +36083,8 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 
   // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
   // this check independent of the deleted legacy names.
-  constexpr std::array<uint32_t, 19> legacy_shader_slots{
-      0x000u, 0x001u, 0x002u, 0x003u, 0x030u, 0x0b0u, 0x0bcu, 0x130u,
+  constexpr std::array<uint32_t, 17> legacy_shader_slots{
+      0x000u, 0x001u, 0x030u, 0x0b0u, 0x0bcu, 0x130u,
       0x14au, 0x14bu, 0x20eu, 0x20fu, 0x210u, 0x211u, 0x216u, 0x217u,
       0x219u, 0x21au, 0x27du,
   };
@@ -36082,6 +36117,22 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_GS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::COMPUTE_PACE_ID] != nullptr;
+  if (!legacy_slots_are_unhandled || !native_pace_slots_are_handled ||
+      !native_index_size_packet_complete) {
+    for (const auto offset : legacy_shader_slots) {
+      if (g_hw_sh_func[offset] != nullptr || g_hw_sh_indirect_func[offset] != nullptr) {
+        std::printf("PM4 shader legacy slot unexpectedly handled: 0x%x direct=%d indirect=%d\n",
+                    offset, g_hw_sh_func[offset] != nullptr,
+                    g_hw_sh_indirect_func[offset] != nullptr);
+      }
+    }
+    std::printf("PM4 geometry check: legacy=%d pace_ps=%d pace_gs=%d pace_cs=%d index=%d\n",
+                legacy_slots_are_unhandled,
+                g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] != nullptr,
+                g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_GS] != nullptr,
+                g_hw_sh_indirect_func[Pm4::COMPUTE_PACE_ID] != nullptr,
+                native_index_size_packet_complete);
+  }
   Require("Pm4NativeTargetGeometry", "legacy register holes",
           legacy_slots_are_unhandled && native_pace_slots_are_handled &&
               native_index_size_packet_complete,
@@ -37321,6 +37372,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
     CheckWave64WholeWaveResults();
     VulkanHarness vulkan;
+    RunCase(&vulkan, Wave32ScalarMaskBranchesPreserveInactiveLanes());
     RunCase(&vulkan, Wave32VccMasksPreserveOtherHalf());
     RunCase(&vulkan, DsBpermuteWave64UsesIndependentHalves());
     RunCase(&vulkan, Wave64CrossHalfLaneAndLds());

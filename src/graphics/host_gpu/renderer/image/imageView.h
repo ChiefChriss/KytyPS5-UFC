@@ -10,6 +10,21 @@ namespace Libs::Graphics {
 
 namespace ImageViewOps {
 
+// A reinterpreting view may not support every usage of its backing format (for example
+// RGB9E5 as a color attachment), so drop usages the view format cannot provide.
+[[nodiscard]] inline vk::ImageUsageFlags ResolveViewUsage(vk::ImageUsageFlags    backing,
+                                                         bool                   storage,
+                                                         vk::FormatFeatureFlags features) noexcept {
+	auto usage = storage ? backing : backing & ~vk::ImageUsageFlagBits::eStorage;
+	if (!(features & vk::FormatFeatureFlagBits::eSampledImage)) {
+		usage &= ~vk::ImageUsageFlagBits::eSampled;
+	}
+	if (!(features & vk::FormatFeatureFlagBits::eColorAttachment)) {
+		usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
+	}
+	return usage;
+}
+
 [[nodiscard]] vk::ImageAspectFlags DepthAspectMask(vk::Format format);
 [[nodiscard]] bool                 FormatsCompatible(vk::Format base, vk::Format view) noexcept;
 

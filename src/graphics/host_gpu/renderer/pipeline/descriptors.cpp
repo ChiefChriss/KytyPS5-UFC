@@ -309,7 +309,7 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
-	                              resource.written && !resource.read && !resource.atomic;
+	                              (resource.atomic || (resource.written && !resource.read));
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
 	                              resource.atomic && !resource.atomic64;
@@ -364,6 +364,13 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 		default: EXIT("null image has unsupported numeric class\n");
 	}
 	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
+	if (resource.depth_compare) {
+		EXIT_IF(binding != TextureCache::BindingType::Texture ||
+		        resource.numeric_class != Prospero::TextureNumericClass::Float);
+		const auto* policy = FindGuestDepthFormatPolicy(desc.info.guest_format);
+		EXIT_IF(policy == nullptr);
+		desc.info.pixel_format = policy->depth_attachment_format;
+	}
 	desc.info.type            = Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
@@ -372,7 +379,8 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
 	desc.view_info.type       = vk::ImageViewType::e2D;
-	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
+	desc.view_info.aspect     = resource.depth_compare ? vk::ImageAspectFlagBits::eDepth
+	                                                  : vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
 	                                : vk::ImageUsageFlagBits::eSampled;
@@ -615,6 +623,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
 	const auto    image_layers = layered ? depth : 1u;
 	auto          view_base    = static_cast<uint32_t>(base_level);
+	const auto max_host_levels = std::bit_width(std::max({width, height, volume ? depth : 1u}));
+	if (levels > max_host_levels) {
+		std::printf("Texture mip diagnostic: extent=%ux%ux%u host_limit=%u requested=%u "
+		            "physical=%u view_base=%u view_levels=%u format=%u tile=%u "
+		            "descriptor=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		            width, height, volume ? depth : 1u, max_host_levels, levels,
+		            physical_levels, view_base, view_levels, static_cast<uint32_t>(format),
+		            static_cast<uint32_t>(tile), descriptor.fields[0], descriptor.fields[1],
+		            descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
+		            descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	}
 	if (levels > physical_levels) {
 		const TileSurfaceDescription physical {
 		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
@@ -625,6 +644,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			     "extent=%ux%ux%u tile=%u\n",
 			     base_level, last_level, max_mip, width, height, depth,
 			     static_cast<uint32_t>(tile));
+		}
+	}
+	if (levels > max_host_levels && view_base < max_host_levels &&
+	    view_levels <= max_host_levels - view_base) {
+		const TileSurfaceDescription original {
+		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
+		    width, height, volume ? depth : 1u, levels, image_layers};
+		if (TileCanTrimMipLevels(original, max_host_levels)) {
+			levels = max_host_levels;
 		}
 	}
 	uint32_t      pitch = 0;
@@ -695,6 +723,29 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	// Extra guest tail mips are distinct texels, even after dimensions reach 1x1.
+	// A single uncompressed storage texel can use a separate linear image backed
+	// by its exact guest byte range; never alias it to the last legal host mip.
+	if (levels > max_host_levels && view_base >= max_host_levels &&
+	    single_storage_mip && view_levels == 1 && !volume && image_layers == 1 &&
+	    samples == 1 && descriptor.BCSwizzle() == 0 && !descriptor.MetaCompress() &&
+	    !shader_conversion && block_bytes == 0 && !depth_tile) {
+		const TileSurfaceDescription original {
+		    format, tile, TileSurfaceDimension::Dim2D, width, height, 1, levels, 1};
+		uint64_t texel_offset = 0;
+		if (TileGetSingleTexelMipOffset(original, view_base, texel_offset)) {
+			desc.info.data = {address + texel_offset, desc.info.bytes_per_block};
+			desc.info.extent = {1, 1, 1};
+			desc.info.resources = {1, 1};
+			desc.info.pitch = 1;
+			desc.info.tile_mode = Prospero::TileMode::kLinear;
+			desc.info.mip_layout = {};
+			desc.info.mip_layout[0] = {0, desc.info.bytes_per_block, 1, 1};
+			desc.view_info.base_level = 0;
+			desc.view_info.level_count = 1;
+			desc.view_info.min_lod = 0;
+		}
+	}
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
@@ -776,6 +827,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	prepared.runtime = &runtime;
+	prepared.buffer_sources.clear();
+	prepared.buffers.clear();
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
@@ -917,12 +970,14 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
+	KYTY_PROFILER_FUNCTION();
 	bool uses_dma = false;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
 	if (uses_dma) {
+		KYTY_PROFILER_BLOCK("Draw::PrepareBda");
 		m_context.PrepareBda();
 	}
 	for (auto* stage: stages) {

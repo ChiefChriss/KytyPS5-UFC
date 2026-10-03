@@ -359,6 +359,9 @@ void GameController::Connect(int id) {
 	if (id != HOST_INPUT_CONTROLLER_ID) {
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
 		    pad != nullptr) {
+			const char* name = SDL_GetGamepadName(pad);
+			Log::WriteToConsoleAndLog(fmt::format("Controller {} connected: {}\n", id,
+			                                      name != nullptr ? name : "unknown"));
 			if (const auto& color = Config::GetControllerColor()) {
 				(void)SDL_SetGamepadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
 			}
@@ -433,6 +436,17 @@ void GameController::AddState() {
 
 void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
+
+	// Pressing a button on any connected gamepad makes it player 1, so a later-connected pad
+	// (for example a virtual pad while Steam Input or a real controller is attached) works.
+	if (down && id != m_active_id && id != HOST_INPUT_CONTROLLER_ID) {
+		const auto it = std::find(m_connected_ids.begin(), m_connected_ids.end(), id);
+		if (it != m_connected_ids.end()) {
+			std::rotate(m_connected_ids.begin(), it, it + 1);
+			CheckActive();
+			Log::WriteToConsoleAndLog(fmt::format("Controller {} is now the active pad\n", id));
+		}
+	}
 
 	// The keyboard shares the player-1 pad with the active gamepad.
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {

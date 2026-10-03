@@ -618,6 +618,28 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
+	vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
+	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFeatures2 fault_query {};
+		fault_query.pNext = &supported_fault;
+		physical_device.getFeatures2(&fault_query);
+	}
+	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
+	if (supported_fault.deviceFault) {
+		fault_features.deviceFault = VK_TRUE;
+		fault_features.pNext       = const_cast<void*>(create_info.pNext);
+		create_info.pNext          = &fault_features;
+	}
+	vk::DeviceDiagnosticsConfigCreateInfoNV diagnostics_config {};
+	if (HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+		diagnostics_config.flags = vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
+		                           vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking;
+		diagnostics_config.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext        = &diagnostics_config;
+	}
+	graphics.device_fault_enabled = supported_fault.deviceFault == VK_TRUE;
+	graphics.checkpoints_enabled =
+	    HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -995,6 +1017,31 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+		// Device fault queries cost nothing until a device loss, so request them for every run.
+		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
+		if (Config::GpuCrashDiagnosticsEnabled()) {
+			for (const auto* extension: {VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME,
+			                             VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME}) {
+				const bool available = HasExtension(available_extensions, extension);
+				if (available) {
+					device_extensions.push_back(extension);
+				}
+				LOGF("GPU crash diagnostics: %s %s\n", extension,
+				     available ? "enabled" : "unavailable");
+			}
+		}
+		if (Config::GpuBreadcrumbsEnabled()) {
+			const bool available =
+			    HasExtension(available_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+			if (available) {
+				device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+			}
+			graphic_ctx.buffer_markers_enabled = available;
+			LOGF("GPU breadcrumbs: %s %s\n", VK_AMD_BUFFER_MARKER_EXTENSION_NAME,
+			     available ? "enabled" : "unavailable");
 		}
 	}
 

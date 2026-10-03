@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -853,6 +854,7 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 }
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	KYTY_PROFILER_BLOCK("SrtRefreshFlatBuffer");
 	if (!m_program.srt_plan_complete) return false;
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
@@ -873,16 +875,20 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		return true;
 	}
-	flat.assign(m_program.srt_reads.size(), 0u);
-	active.assign(m_program.descriptor_sources.size(), 1u);
-	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) active.at(source) = 0u;
-	}
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
-	visited.assign(m_program.control_flow.size(), 0u);
-	pending.clear();
-	pending.push_back(0u);
+	{
+		KYTY_PROFILER_BLOCK("SrtControlFlowSetup");
+		flat.assign(m_program.srt_reads.size(), 0u);
+		active.assign(m_program.descriptor_sources.size(), 1u);
+		for (const auto& block: m_program.control_flow) {
+			for (const auto source: block.sources) active.at(source) = 0u;
+		}
+		visited.assign(m_program.control_flow.size(), 0u);
+		pending.clear();
+		pending.push_back(0u);
+	}
+	KYTY_PROFILER_BLOCK("SrtControlFlowWalkEvaluate");
 	while (!pending.empty()) {
 		const auto index = pending.back();
 		pending.pop_back();

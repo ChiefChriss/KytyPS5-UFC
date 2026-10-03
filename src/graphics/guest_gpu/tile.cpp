@@ -12,6 +12,39 @@
 #include <bit>
 
 namespace Libs::Graphics {
+bool TileGetSingleTexelMipOffset(const TileSurfaceDescription& description, uint32_t level,
+                                uint64_t& offset) {
+	if (description.dimension != TileSurfaceDimension::Dim2D || description.layers != 1 ||
+	    description.depth != 1 || level >= description.levels || level >= 16 ||
+	    std::max(description.width >> level, 1u) != 1 ||
+	    std::max(description.height >> level, 1u) != 1) return false;
+	TileSurfaceLayout surface {};
+	if (!TileGetTiledTextureLayout(description, surface) || level < surface.first_tail_level ||
+	    surface.texture.texel_width != 1 || surface.texture.texel_height != 1) return false;
+	const auto& mip = surface.mips[level];
+	uint32_t within_block = 0;
+	if (!TileGetBlockOffset(surface.texture.block, mip.tail_x, mip.tail_y, 0, within_block))
+		return false;
+	const auto result = mip.offset + within_block;
+	if (result + surface.texture.block.bytes_per_element > surface.total_size) return false;
+	offset = result;
+	return true;
+}
+bool TileCanTrimMipLevels(const TileSurfaceDescription& description, uint32_t retained_levels) {
+	if (retained_levels == 0 || retained_levels > description.levels) return false;
+	TileSurfaceLayout original {}, trimmed {};
+	auto limited = description;
+	limited.levels = retained_levels;
+	if (!TileGetTiledTextureLayout(description, original) ||
+	    !TileGetTiledTextureLayout(limited, trimmed)) return false;
+	if (original.first_tail_level != trimmed.first_tail_level ||
+	    original.block_slice_size != trimmed.block_slice_size ||
+	    original.total_size != trimmed.total_size) return false;
+	for (uint32_t level = 0; level < retained_levels; ++level) {
+		if (original.mips[level] != trimmed.mips[level]) return false;
+	}
+	return true;
+}
 
 static uint32_t ShiftCeil(uint32_t value, uint32_t shift) {
 	return static_cast<uint32_t>((static_cast<uint64_t>(value) + (1ull << shift) - 1ull) >> shift);

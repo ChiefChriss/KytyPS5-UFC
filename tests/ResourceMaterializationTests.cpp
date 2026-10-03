@@ -408,6 +408,38 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+void TestUfcSignedAtomicImage() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  AddValueBlock(program);
+  const uint32_t words[] = {0x11630b00u, 0xc1500000u, 0x0003c003u,
+                           0xa0900204u, 0x0000000fu, 0x00700000u, 0u, 0u};
+  DescriptorSource source;
+  source.dword_count = 8;
+  for (uint32_t i = 0; i < 8; ++i) source.dwords[i] = Value(words[i]);
+  program.descriptor_sources.push_back(source);
+  program.info.images.push_back(
+      {.source = 0, .resource_class = ImageResourceClass::Storage,
+       .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D,
+       .read = true, .written = true, .atomic = true});
+  auto plan = ExtractResourcePlan(program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {}, snapshot, specialization),
+        "UFC signed R32 atomic descriptor was rejected");
+  Check(specialization.images.size() == 1 &&
+            specialization.images[0].numeric_class ==
+                Libs::Graphics::Prospero::TextureNumericClass::Uint,
+        "atomic image must use the raw U32 shader representation");
+  program.info.images[0].atomic = false;
+  plan = ExtractResourcePlan(program);
+  Check(!MaterializeResources(plan, {}, snapshot, specialization),
+        "ordinary signed storage reads should remain unsupported");
+}
+
 } // namespace
 
 namespace Common {
@@ -432,6 +464,7 @@ int main() {
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestUfcSignedAtomicImage();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

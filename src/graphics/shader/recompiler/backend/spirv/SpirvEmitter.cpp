@@ -24,11 +24,11 @@ void ValidateNativeProgram(const IR::Program& program) {
 	std::array<std::vector<uint32_t>, KindCount> expected;
 	std::array<bool, KindCount>                  present {};
 	const auto                                   Dense = [](size_t size) {
-		std::vector<uint32_t> values(size);
-		for (uint32_t i = 0; i < values.size(); i++) {
-			values[i] = i;
-		}
-		return values;
+        std::vector<uint32_t> values(size);
+        for (uint32_t i = 0; i < values.size(); i++) {
+            values[i] = i;
+        }
+        return values;
 	};
 	auto Expect = [&](Kind kind, std::vector<uint32_t> resources = {}) {
 		const auto index = static_cast<size_t>(kind);
@@ -52,8 +52,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if (!program.info.samplers.empty()) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
 	}
-	auto& buffers = expected[static_cast<size_t>(Kind::Buffers)];
-	const bool uses_gds = IR::CollectMemoryResources(program, buffers);
+	auto&      buffers                          = expected[static_cast<size_t>(Kind::Buffers)];
+	const bool uses_gds                         = IR::CollectMemoryResources(program, buffers);
 	present[static_cast<size_t>(Kind::Buffers)] = !buffers.empty();
 	if (uses_gds) {
 		Expect(Kind::Gds);
@@ -84,7 +84,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 		}
 	}
 	const auto has_shader_data_storage = present[static_cast<size_t>(Kind::ShaderData)];
-	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
+	const auto shader_data_dwords      = program.bindings.ShaderDataDwords();
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
@@ -125,7 +125,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 	const auto local_flat_handle = [&](const IR::Inst& handle) {
 		return !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
-			       if (IR::AddressOpcodeInfoOf(use.user->GetOpcode()).access == IR::AddressAccess::None)
+			       if (IR::AddressOpcodeInfoOf(use.user->GetOpcode()).access ==
+			           IR::AddressAccess::None)
 				       return false;
 			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
 			       return index < program.memory_info.size() &&
@@ -148,7 +149,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 					if (planning_only_handle(inst)) {
 						break;
 					}
-					if (inst.NumArgs() != 2 || (!program.info.uses_dma && !local_flat_handle(inst))) {
+					if (inst.NumArgs() != 2 ||
+					    (!program.info.uses_dma && !local_flat_handle(inst))) {
 						Fail(program, "typed address handle has invalid DMA metadata");
 					}
 					break;
@@ -204,8 +206,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 						Fail(program, "scratch operation has no per-thread storage");
 					}
 					requirements.function_scratch = true;
-					if (kind == IR::ResourceKind::FlatLocal && program.stage != ShaderType::Compute &&
-					    program.stage != ShaderType::Mesh) {
+					if (kind == IR::ResourceKind::FlatLocal &&
+					    program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh) {
 						requirements.function_lds = true;
 					}
 				} else if (address_access == IR::AddressAccess::Write) {
@@ -263,6 +265,17 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				}
 			}
 			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::ConditionRef: {
+					const auto kind = inst.Flags<CFG::BranchCondition>();
+					if (program.stage == ShaderType::Compute && program.wave_size == 32 &&
+					    (kind == CFG::BranchCondition::ExecZero ||
+					     kind == CFG::BranchCondition::ExecNonZero ||
+					     kind == CFG::BranchCondition::VccZero ||
+					     kind == CFG::BranchCondition::VccNonZero)) {
+						requirements.subgroup_ballot = true;
+					}
+					break;
+				}
 				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::DppMoveU32:
@@ -307,8 +320,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					if (index >= program.export_info.size()) {
 						Fail(program, "attribute export has invalid metadata");
 					}
-					if (program.stage == ShaderType::Pixel &&
-					    program.export_info[index].vm) {
+					if (program.stage == ShaderType::Pixel && program.export_info[index].vm) {
 						requirements.pixel_valid_mask = true;
 					}
 					break;
@@ -320,8 +332,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	return requirements;
 }
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info) {
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -337,7 +348,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
-	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
+	const auto*  workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u

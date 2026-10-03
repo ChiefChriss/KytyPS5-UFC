@@ -70,6 +70,10 @@ static void PrintUsage() {
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
+	::printf("  --gpu-crash-diagnostics <t|f>        Record GPU checkpoints and report the last\n"
+	         "                                       draw/dispatch reached on device loss.\n");
+	::printf("  --gpu-breadcrumbs <true|false>       Unserialized per-command GPU markers that\n"
+	         "                                       bound the in-flight work on device loss.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
@@ -372,6 +376,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--gpu-assisted-validation") {
 			if (!ParseBool(value, options.config.gpu_assisted_validation_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-crash-diagnostics") {
+			if (!ParseBool(value, options.config.gpu_crash_diagnostics_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-breadcrumbs") {
+			if (!ParseBool(value, options.config.gpu_breadcrumbs_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

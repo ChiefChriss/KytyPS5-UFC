@@ -105,6 +105,9 @@ bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode
                                TileTextureBlockLayout& layout);
 bool TileGetTiledTextureLayout(const TileSurfaceDescription& description,
                                TileSurfaceLayout&            layout);
+bool TileCanTrimMipLevels(const TileSurfaceDescription& description, uint32_t retained_levels);
+bool TileGetSingleTexelMipOffset(const TileSurfaceDescription& description, uint32_t level,
+                                uint64_t& offset);
 bool TileGetBlockOffset(const TileBlockLayout& layout, uint32_t x, uint32_t y, uint32_t z,
                         uint32_t& byte_offset);
 bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t block_y,

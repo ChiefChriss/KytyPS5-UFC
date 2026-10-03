@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/copyGeometry.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 
@@ -316,24 +317,8 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 
 std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
                                                         const Image& destination, uint32_t depth) {
-	const auto source_type        = source.backing.image_type;
-	const auto destination_type   = destination.backing.image_type;
-	uint32_t   source_layers      = source.backing.layers;
-	uint32_t   destination_layers = destination.backing.layers;
-	if (source_type == vk::ImageType::e3D) {
-		source_layers = 1;
-	}
-	if (destination_type == vk::ImageType::e3D) {
-		destination_layers = 1;
-	}
-	if (source_type == destination_type) {
-		source_layers = destination_layers = std::min(source_layers, destination_layers);
-	} else if (source_type == vk::ImageType::e2D && destination_type == vk::ImageType::e3D) {
-		source_layers = depth;
-	} else if (source_type == vk::ImageType::e3D && destination_type == vk::ImageType::e2D) {
-		destination_layers = depth;
-	}
-	return {source_layers, destination_layers};
+	return ImageCopyLayerCounts(source.backing.image_type, source.backing.layers,
+	                            destination.backing.image_type, destination.backing.layers, depth);
 }
 
 void Image::CopyImage(Image& source) {
@@ -352,9 +337,15 @@ void Image::CopyImage(Image& source) {
 	std::vector<vk::ImageCopy> copies;
 	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width  = std::max(source.backing.extent.width >> level, 1u);
-		const auto height = std::max(source.backing.extent.height >> level, 1u);
-		const auto depth  = std::max(base_depth >> level, 1u);
+		const auto width  = std::min(std::max(source.backing.extent.width >> level, 1u),
+		                             std::max(backing.extent.width >> level, 1u));
+		const auto height = std::min(std::max(source.backing.extent.height >> level, 1u),
+		                             std::max(backing.extent.height >> level, 1u));
+		const auto depth  = source.backing.image_type == vk::ImageType::e3D &&
+		                    backing.image_type == vk::ImageType::e3D
+		                        ? std::min(std::max(source.backing.extent.depth >> level, 1u),
+		                                   std::max(backing.extent.depth >> level, 1u))
+		                        : std::max(base_depth >> level, 1u);
 		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 		vk::ImageCopy copy {};
 		copy.srcSubresource = {source_aspect, level, 0, 1};
@@ -555,7 +546,9 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	const auto height = std::max(backing.extent.height >> mip, 1u);
 	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
 	EXIT_IF(width != source.backing.extent.width || height != source.backing.extent.height);
-	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
+	const auto [source_layers, destination_layers] = ImageCopyLayerCounts(
+	    source.backing.image_type, source.backing.layers, backing.image_type,
+	    backing.layers - layer, depth);
 	const auto aspects                             = FullAspectMask(source.backing.format);
 	EXIT_IF(aspects != FullAspectMask(backing.format));
 	std::array<vk::ImageCopy, 2> copies {};
@@ -568,7 +561,16 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 		auto& copy          = copies[copy_count++];
 		copy.srcSubresource = {aspect, 0, 0, source_layers};
 		copy.dstSubresource = {aspect, mip, layer, destination_layers};
-		copy.extent         = {width, height, depth};
+		const uint32_t copy_depth = source.backing.image_type == vk::ImageType::e2D &&
+		                            backing.image_type == vk::ImageType::e3D
+		                                ? source_layers
+		                            : source.backing.image_type == vk::ImageType::e3D &&
+		                              backing.image_type == vk::ImageType::e2D
+		                                ? std::min(destination_layers, source.backing.extent.depth)
+		                            : backing.image_type == vk::ImageType::e3D
+		                                ? std::min(depth, source.backing.extent.depth)
+		                                : 1u;
+		copy.extent         = {width, height, copy_depth};
 	}
 	auto command = m_scheduler.Current().Handle();
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
