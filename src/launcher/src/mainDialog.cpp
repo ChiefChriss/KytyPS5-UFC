@@ -265,9 +265,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
 	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
 	args << "--network-connected" << BoolArg(info.network_connected);
-	if (info.tessellation_enabled) {
-		args << "--tessellation";
-	}
+	args << (info.tessellation_enabled ? "--tessellation" : "--no-tessellation");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
