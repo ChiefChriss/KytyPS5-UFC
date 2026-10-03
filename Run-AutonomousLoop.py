@@ -18,9 +18,14 @@ ROOT = Path(__file__).resolve().parent
 MODELS = ('openai/gpt-6.1-sol', 'meta/muse-spark-1.3',
           'opencode/muse-spark-1.3-contributor-free')
 QUOTA = re.compile(r'quota|credits?|usage.limit|limit.reached|rate.limit|429|insufficient.funds', re.I)
-PROMPT = ('Perform one focused local UFC 5 improvement cycle using HANDOFF.md and LOOP-LOG.md. '
-          'Continue from the latest evidence, preserve prior fixes, build/test/run as needed, '
-          'record results and the next hypothesis, then return. Do not ask for approval or start another loop.')
+PROMPT = ('ENGINE OPTIMIZATION ONLY: work on emulator C++/shader engine code, not automation tooling. '
+          'Read HANDOFF.md, LOOP-LOG.md, UPSTREAM-COMPARISON.md. First obtain a clean actual UFC 5 '
+          'fight profile on the merged dev build if none exists; then choose the highest-confidence '
+          'CPU/GPU engine hotspot and make one narrowly scoped optimization preserving correctness/image '
+          'quality. Do not alter resolution, skip guest work, clamp a shader, or weaken validation to fake FPS. '
+          'Build, run relevant tests and full CTest, then compare a clean same-settings gameplay run. '
+          'Record measured evidence and next engine hypothesis in LOOP-LOG.md. Preserve existing work. '
+          'Do not ask for approval or start another loop.')
 
 
 def command(model):

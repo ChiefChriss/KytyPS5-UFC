@@ -23,6 +23,17 @@ Perform ONE focused evidence-driven cycle per invocation, then return. An extern
 supervisor schedules the next cycle and handles quota fallback. Do not start a second
 supervisor, modify its files/configuration, or launch other agents.
 
+## Current mandate: engine upgrades
+
+Work on emulator engine code (`src/graphics/**`, `src/graphics/shader/**`, kernel runtime or
+guest libraries only when profiling justifies it). Do not spend cycles adding scripts,
+changing prompts/config, or polishing documentation. The harness is already operational.
+If the merged branch has no comparable post-rebase gameplay profile, the first cycle should
+produce one (Tracy capture around detected fighting, matched 2560x1440/Mailbox settings).
+Subsequent cycles must select the engine hotspot with the strongest evidence and change one
+thing at a time. The user's target is stable, correct fighting with materially higher FPS,
+lower RAM/VRAM, and good rendering quality; test at least 120 seconds of actual fighting.
+
 Never commit, push, reset, clean, discard existing working-tree changes, alter TDR registry
 settings, or claim a performance/quality improvement without comparative evidence.
 Preserve the verified wave32 scalar mask-branch fix. No shader-specific loop clamps,
