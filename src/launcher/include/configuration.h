@@ -123,6 +123,7 @@ public:
 	bool                   readback_linear_images      = true;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = true;
+	bool                   async_pipelines_enabled     = true;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   skip_notice_screen          = false;
@@ -161,6 +162,7 @@ public:
 		readback_linear_images      = other.readback_linear_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
+		async_pipelines_enabled     = other.async_pipelines_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		skip_notice_screen          = other.skip_notice_screen;
