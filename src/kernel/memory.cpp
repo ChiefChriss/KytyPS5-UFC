@@ -1149,6 +1149,12 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
+void PrepareHostRead(const void* source, uint64_t size) {
+	if (g_gpu_resources != nullptr && size != 0) {
+		g_gpu_resources->PrepareHostRead(source, size);
+	}
+}
+
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;

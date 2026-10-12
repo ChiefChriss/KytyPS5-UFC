@@ -716,6 +716,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 
 	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
 
+	Memory::PrepareHostRead(buf, nbytes);
 	file->mutex.Lock();
 
 	bool     is_invalid    = file->f.IsInvalid();
@@ -931,6 +932,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 
 	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
 
+	Memory::PrepareHostRead(buf, nbytes);
 	file->mutex.Lock();
 
 	bool     is_invalid    = file->f.IsInvalid();
@@ -1005,6 +1007,7 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 			continue;
 		}
 		uint32_t bytes = 0;
+		Memory::PrepareHostRead(buffer.iov_base, buffer.iov_len);
 		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
 		bytes_written += bytes;
 		if (bytes < buffer.iov_len) {

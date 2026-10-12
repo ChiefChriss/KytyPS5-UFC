@@ -78,9 +78,33 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.InvalidateFaultedPage(fault_vaddr);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		// A page can be protected for a GPU-written buffer, for GPU-written images whose guest
+		// bytes are stale, or both: the buffer bytes first, the image is newer when it is
+		// protected (see TextureCache::ArmImageRead()).
+		const auto watchers = m_page_manager.Watchers(fault_vaddr);
+		if (watchers.image_read == 0 || watchers.buffer_read != 0) {
+			m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		}
+		if (watchers.image_read != 0) {
+			m_texture_cache.ResolveImageReadFault(fault_vaddr);
+		}
 	}
 	return true;
+}
+
+void RenderContext::PrepareHostRead(const void* source, uint64_t size) noexcept {
+	const auto vaddr     = reinterpret_cast<uint64_t>(source);
+	const auto page_size = m_page_manager.GetPageSize();
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	// A read-protected page would fail the system call instead of faulting.
+	for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
+		const auto watchers = m_page_manager.Watchers(page);
+		if (watchers.buffer_read != 0 || watchers.image_read != 0) {
+			(void)HandleFault(PageFaultAccess::Read, std::max(page, vaddr));
+		}
+	}
 }
 
 void RenderContext::PrepareGpuWrite(const void* destination, uint64_t size) noexcept {

@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <type_traits>
@@ -93,6 +94,15 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Fault modes of --image-cpu-readback: the guest pages of GPU-written tiled images whose bytes
+	// the CPU has not seen are read protected. A CPU access of such a page comes here (any thread):
+	// it publishes the GPU contents of the protected images on the page of `address` into guest
+	// memory and lifts their protection. The calling thread waits for the GPU; when it is not the
+	// execution thread, the execution thread does not. Images whose bytes overlap the skipped
+	// range are left protected: a CPU write is about to replace them.
+	void ResolveImageReadFault(uint64_t address, uint64_t skip_address = 0,
+	                           uint64_t skip_size = 0);
+	[[nodiscard]] bool ReadsBackOnFault() const noexcept { return m_fault_readback; }
 	// Advances whenever an image is registered or unregistered.
 	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }
 	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
@@ -216,6 +226,69 @@ private:
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// Records the download of the image's guest bytes into `mapped` (`destination` at `offset`),
+	// starting from the current guest bytes so that bytes the image does not cover survive. False
+	// when the guest bytes cannot be read.
+	[[nodiscard]] bool RecordImageReadback(Image& image, Buffer& destination, uint64_t offset,
+	                                       uint8_t* mapped);
+
+	// Read protection of GPU-written images (fault modes). Callers hold m_lock.
+	[[nodiscard]] bool CanArmImageRead(Image& image);
+	void               ArmImageRead(Image& image);
+	void               DisarmImageRead(Image& image);
+	// A GPU write of the image was recorded: protects its pages when the CPU may read it.
+	void               NoteGpuWrite(Image& image);
+	// After a change of the image's ownership: lifts the protection the image no longer allows.
+	void               ReconcileImageRead(Image& image);
+	// A GPU buffer write or a CPU write replaced the image's GPU contents.
+	void               NoteImageOverwrite(Image& image);
+
+	// A fault on a read-protected page, as the execution thread sees it.
+	static constexpr uint32_t FaultTickets = 4;
+	struct ImageReadFault {
+		TextureCache*                      cache        = nullptr;
+		uint64_t                           page         = 0;
+		uint64_t                           skip_begin   = 0;
+		uint64_t                           skip_end     = 0;
+		std::array<uint32_t, FaultTickets> tickets      = {};
+		uint32_t                           ticket_count = 0;
+		// More protected images remain on the page: the faulting thread asks again.
+		bool                               more         = false;
+		// The faulting thread records the readback itself (the execution thread, or no GPU).
+		bool                               execution    = false;
+	};
+	// A readback of protected images recorded for faulting threads, published by the first of
+	// them that sees the GPU reach its tick.
+	static constexpr uint32_t TicketImages = 8;
+	struct ReadbackTicket {
+		enum State : uint32_t { Free, Recorded, Publishing, Done };
+		struct Entry {
+			ImageId  id;
+			uint64_t serial     = 0;
+			uint64_t gpu_writes = 0;
+			uint64_t address    = 0;
+			uint64_t size       = 0;
+			uint64_t offset     = 0;
+			// Cleared when the image is unregistered before the publication.
+			bool     valid      = false;
+		};
+		ReadbackTicket();
+		~ReadbackTicket();
+		KYTY_CLASS_NO_COPY(ReadbackTicket);
+
+		alignas(64) std::atomic<uint32_t> state {Free};
+		std::atomic<uint32_t> holders {0};
+		uint64_t                          tick  = 0;
+		uint32_t                          count = 0;
+		std::array<Entry, TicketImages>   entries {};
+		std::unique_ptr<Buffer>           buffer;
+	};
+	// The last ticket is the execution thread's own, for its faults and when the others are busy.
+	static constexpr uint32_t ReadbackTicketCount = 16;
+	static constexpr uint32_t ExecutionTicket     = ReadbackTicketCount;
+	void PrepareImageReadback(ImageReadFault& fault);
+	void PublishImageReadback(uint32_t ticket);
+	void LogImageReadbackStats();
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -249,6 +322,36 @@ private:
 	static constexpr uint64_t ImageSetChangeHistory = 1024;
 	std::array<std::pair<uint64_t, uint64_t>, ImageSetChangeHistory> m_image_set_changes {};
 	bool             m_readback_linear_images = false;
+	// --image-cpu-readback: small GPU-written tiled images are downloaded on every frame, larger
+	// ones (or all) are read back when the CPU reads them.
+	bool             m_small_tiled_readback = false;
+	bool             m_fault_readback       = false;
+	uint64_t         m_fault_readback_max   = 0;
+	uint64_t         m_read_arm_serial      = 0;
+	std::array<ReadbackTicket, ReadbackTicketCount + 1> m_readback_tickets;
+	// Readback counters (KYTY_IMAGE_READBACK_STATS=1 logs them every few seconds).
+	struct ReadbackStats {
+		alignas(64) std::atomic<uint64_t> arms {0};
+		std::atomic<uint64_t> disarms {0};
+		std::atomic<uint64_t> rejected {0};
+		std::atomic<uint64_t> faults {0};
+		std::atomic<uint64_t> gpu_thread_faults {0};
+		std::atomic<uint64_t> write_faults {0};
+		std::atomic<uint64_t> unpublished {0};
+		std::atomic<uint64_t> readbacks {0};
+		std::atomic<uint64_t> shared {0};
+		std::atomic<uint64_t> published {0};
+		std::atomic<uint64_t> published_bytes {0};
+		std::atomic<uint64_t> kept {0};
+		std::atomic<uint64_t> wait_us {0};
+		std::atomic<uint64_t> priority_waits {0};
+		std::atomic<uint64_t> protections {0};
+		std::atomic<uint64_t> dormant {0};
+	};
+	ReadbackStats    m_readback_stats;
+	bool             m_readback_stats_enabled = false;
+	uint64_t         m_readback_stats_time    = 0;
+	uint64_t         m_readback_stats_frames  = 0;
 	// Lookups that found an existing image with the same backing, by description: while no image
 	// on the pages of the range was registered or unregistered since, the same lookup finds the
 	// same image.

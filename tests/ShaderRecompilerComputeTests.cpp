@@ -67,6 +67,7 @@
 #endif
 
 #include <algorithm>
+#include <map>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -390,6 +391,96 @@ struct TextureCacheTestAccess {
     auto &metadata = cache.m_surface_metas[address];
     metadata.type = TextureCache::MetaDataInfo::Type::HTile;
     metadata.clear_mask = 0;
+  }
+
+  static void SetFaultReadback(TextureCache &cache, bool enabled) {
+    cache.m_fault_readback = enabled;
+    cache.m_small_tiled_readback = false;
+    cache.m_fault_readback_max = 32ull * 1024 * 1024;
+  }
+
+  static bool ReadArmed(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    const auto *image = cache.m_slot_images.try_get(id);
+    return image != nullptr && image->read_arm.serial != 0;
+  }
+
+  static PageManager::PageWatchers Watchers(TextureCache &cache,
+                                            uint64_t address) {
+    return cache.m_page_manager.Watchers(address);
+  }
+
+  struct ReadbackCounts {
+    uint64_t readbacks = 0;
+    uint64_t shared = 0;
+    uint64_t published = 0;
+    uint64_t kept = 0;
+    uint64_t unpublished = 0;
+  };
+  static ReadbackCounts Counts(TextureCache &cache) {
+    const auto &stats = cache.m_readback_stats;
+    return {stats.readbacks.load(), stats.shared.load(), stats.published.load(),
+            stats.kept.load(), stats.unpublished.load()};
+  }
+
+  // Every protected image is eligible, and the image read watcher count of every page of
+  // [address, address + size) is the number of protected images on it.
+  static bool ValidateReadArms(TextureCache &cache, uint64_t address,
+                               uint64_t size) {
+    std::lock_guard lock(cache.m_lock);
+    std::map<uint64_t, uint32_t> pages;
+    bool valid = true;
+    cache.m_slot_images.ForEach([&](ImageId, Image &image) {
+      if (image.read_arm.serial == 0) {
+        return;
+      }
+      valid = valid && image.registered && !image.depth_id &&
+              image.SafeToDownload() && cache.CanArmImageRead(image);
+      for (auto page = image.read_arm.address & ~(TRACKER_PAGE_SIZE - 1);
+           page < image.read_arm.address + image.read_arm.size;
+           page += TRACKER_PAGE_SIZE) {
+        pages[page]++;
+      }
+    });
+    for (auto page = address & ~(TRACKER_PAGE_SIZE - 1); page < address + size;
+         page += TRACKER_PAGE_SIZE) {
+      const auto found = pages.find(page);
+      const uint32_t expected = found == pages.end() ? 0u : found->second;
+      valid = valid && cache.m_page_manager.Watchers(page).image_read == expected;
+    }
+    return valid;
+  }
+
+  // Records the readback a fault on the page would (without publishing it).
+  static std::vector<uint32_t> PrepareFault(TextureCache &cache,
+                                            uint64_t address) {
+    TextureCache::ImageReadFault fault;
+    fault.cache = &cache;
+    fault.page = address & ~(TRACKER_PAGE_SIZE - 1);
+    fault.execution = true;
+    cache.PrepareImageReadback(fault);
+    return {fault.tickets.begin(), fault.tickets.begin() + fault.ticket_count};
+  }
+
+  static void Publish(TextureCache &cache, uint32_t ticket) {
+    cache.PublishImageReadback(ticket);
+  }
+
+  static void AdvanceGcTick(TextureCache &cache, uint64_t ticks) {
+    std::lock_guard lock(cache.m_lock);
+    cache.m_gc_tick += ticks;
+  }
+
+  static void FreeImage(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.FreeImage(id);
+  }
+
+  static bool TicketsFree(TextureCache &cache) {
+    return std::ranges::all_of(cache.m_readback_tickets, [](const auto &ticket) {
+      return ticket.state.load() == TextureCache::ReadbackTicket::Free &&
+             ticket.holders.load() == 0;
+    });
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
@@ -12784,6 +12875,281 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "standard-tiled color allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // --image-cpu-readback fault: GPU-written tiled targets are read protected, and a CPU access
+  // reads them back into guest memory.
+  void CheckFaultImageReadback() {
+    constexpr const char *name = "FaultImageReadback";
+    constexpr uintptr_t base = 0x0000000209800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr auto format = Prospero::BufferFormat::k32Float;
+    constexpr auto tile = Prospero::TileMode::kStandard4KB;
+    EnsureRuntimeContext();
+
+    TileSizeAlign slice{};
+    TileGetTextureSize(format, 64, 64, 1, tile, &slice, nullptr, nullptr);
+    Require(name, "tile layout", slice.size == 0x4000,
+            "64x64 R32F Standard4KB footprint is not 16 KiB");
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "fault readback allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fault readback mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorInfo(
+          0, {.format = Prospero::ChannelLayout::k32,
+              .channel_type = Prospero::ChannelType::kFloat,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorView(
+          0, {.base_array_slice_index = 0, .last_array_slice_index = 0});
+      registers.SetColorAttrib2(0, {.height = 63, .width = 63});
+      registers.SetColorAttrib3(0, {.tile_mode = tile,
+                                    .dimension = 1,
+                                    .metadata_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+
+      auto &resources = context;
+      auto &texture_cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      TextureCacheTestAccess::SetFaultReadback(texture_cache, true);
+      resources.MapMemory(base, allocation_size);
+
+      ImageInfo target_info{};
+      const auto bind = [&](uint64_t address) {
+        registers.SetColorBase(0, {.addr = address});
+        RenderColorInfo color{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), color, 0);
+        Require(name, "target discovery",
+                color.image_id && color.desc.info.data.address == address &&
+                    color.desc.info.data.size == slice.size,
+                "the 64x64 tiled target was not discovered at its address");
+        (void)texture_cache.FindRenderTarget(color.image_id, color.desc);
+        target_info = color.desc.info;
+        return color.image_id;
+      };
+      const auto clear = [&](ImageId id, float value) {
+        vk::ClearValue clear_value{};
+        clear_value.color.float32 = std::array{value, 0.0f, 0.0f, 0.0f};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear_value);
+      };
+      const auto guest_holds = [&](uint64_t address, float expected) {
+        std::vector<float> values(slice.size / sizeof(float));
+        return Libs::LibKernel::Memory::TryReadBacking(address, values.data(),
+                                                       slice.size) &&
+               std::ranges::all_of(values,
+                                   [&](float value) { return value == expected; });
+      };
+      const auto protected_pages = [&](uint64_t address, uint32_t expected) {
+        for (uint64_t page = address & ~(TRACKER_PAGE_SIZE - 1);
+             page < address + slice.size; page += TRACKER_PAGE_SIZE) {
+          if (TextureCacheTestAccess::Watchers(texture_cache, page).image_read !=
+              expected) {
+            return false;
+          }
+        }
+        return true;
+      };
+      const auto valid = [&] {
+        return TextureCacheTestAccess::ValidateReadArms(texture_cache, base,
+                                                        allocation_size);
+      };
+
+      const auto target = base + 0x10000;
+      const auto id = bind(target);
+      Require(name, "protection on GPU write",
+              TextureCacheTestAccess::ReadArmed(texture_cache, id) &&
+                  protected_pages(target, 1) && valid(),
+              "binding a tiled render target did not read protect its pages");
+      clear(id, 1.5f);
+      Require(name, "repeated GPU writes",
+              TextureCacheTestAccess::ReadArmed(texture_cache, id) &&
+                  protected_pages(target, 1) && !guest_holds(target, 1.5f),
+              "a second GPU write changed the protection");
+
+      auto counts = TextureCacheTestAccess::Counts(texture_cache);
+      Require(name, "read fault",
+              resources.HandleFault(PageFaultAccess::Read, target + 0x1004),
+              "a read of a protected image page was not resolved");
+      auto after = TextureCacheTestAccess::Counts(texture_cache);
+      Require(name, "read fault publication",
+              !TextureCacheTestAccess::ReadArmed(texture_cache, id) &&
+                  protected_pages(target, 0) && guest_holds(target, 1.5f) &&
+                  after.readbacks == counts.readbacks + 1 &&
+                  after.published == counts.published + 1 &&
+                  TextureCacheTestAccess::TicketsFree(texture_cache) && valid(),
+              "the fault did not publish the GPU contents and lift the protection");
+      Require(name, "image ownership after publication",
+              texture_cache.GetImage(id).IsGpuModified() &&
+                  !texture_cache.GetImage(id).IsCpuDirty(),
+              "publishing the image changed its GPU ownership");
+
+      // Concurrent faults on the pages of one image read it back once.
+      Require(name, "rebind", bind(target) == id &&
+                                  TextureCacheTestAccess::ReadArmed(texture_cache, id),
+              "the next GPU write did not protect the published image again");
+      clear(id, 2.5f);
+      counts = TextureCacheTestAccess::Counts(texture_cache);
+      std::atomic<bool> resolved{true};
+      {
+        std::vector<std::jthread> faulting;
+        for (uint64_t index = 0; index < 4; index++) {
+          faulting.emplace_back([&, index] {
+            // As HandleFault() resolves a page protected for images only (without a GPU, the
+            // buffer path of a fault that comes after the publication needs one).
+            texture_cache.ResolveImageReadFault(target + index * TRACKER_PAGE_SIZE + 64);
+          });
+        }
+      }
+      after = TextureCacheTestAccess::Counts(texture_cache);
+      Require(name, "concurrent read faults",
+              resolved && !TextureCacheTestAccess::ReadArmed(texture_cache, id) &&
+                  guest_holds(target, 2.5f) &&
+                  after.readbacks == counts.readbacks + 1 &&
+                  after.published == counts.published + 1 &&
+                  TextureCacheTestAccess::TicketsFree(texture_cache) && valid(),
+              "concurrent faults did not share one readback");
+
+      // A GPU write after the readback was recorded keeps the protection.
+      (void)bind(target);
+      clear(id, 3.5f);
+      const auto tickets = TextureCacheTestAccess::PrepareFault(texture_cache, target);
+      Require(name, "recorded readback", tickets.size() == 1,
+              "the fault recorded no readback");
+      clear(id, 4.5f);
+      counts = TextureCacheTestAccess::Counts(texture_cache);
+      TextureCacheTestAccess::Publish(texture_cache, tickets.front());
+      after = TextureCacheTestAccess::Counts(texture_cache);
+      Require(name, "newer GPU write",
+              TextureCacheTestAccess::ReadArmed(texture_cache, id) &&
+                  guest_holds(target, 3.5f) && after.kept == counts.kept + 1 &&
+                  TextureCacheTestAccess::TicketsFree(texture_cache) && valid(),
+              "a readback older than the image lifted its protection");
+      Require(name, "read after newer write",
+              resources.HandleFault(PageFaultAccess::Read, target) &&
+                  !TextureCacheTestAccess::ReadArmed(texture_cache, id) &&
+                  guest_holds(target, 4.5f),
+              "the next fault did not publish the newer GPU write");
+
+      // An image that GPU buffer writes keep replacing before any CPU read is left unprotected
+      // while that goes on, and protected again once it stops.
+      for (int cycle = 0; cycle < 3; cycle++) {
+        (void)bind(target);
+        Require(name, "overwritten image protection",
+                TextureCacheTestAccess::ReadArmed(texture_cache, id),
+                "an overwritten image was not protected on its next GPU write");
+        texture_cache.InvalidateMemoryFromGPU(target, slice.size);
+        Require(name, "buffer overwrite",
+                !TextureCacheTestAccess::ReadArmed(texture_cache, id) &&
+                    protected_pages(target, 0),
+                "a GPU buffer write over the image kept its protection");
+      }
+      (void)bind(target);
+      Require(name, "dormant protection",
+              !TextureCacheTestAccess::ReadArmed(texture_cache, id) && valid(),
+              "an image replaced on every frame was protected again");
+      TextureCacheTestAccess::AdvanceGcTick(texture_cache, 3);
+      (void)bind(target);
+      Require(name, "protection after the overwrites stop",
+              TextureCacheTestAccess::ReadArmed(texture_cache, id) && valid(),
+              "an image no longer replaced was not protected again");
+      Require(name, "read after dormancy",
+              resources.HandleFault(PageFaultAccess::Read, target) &&
+                  !TextureCacheTestAccess::ReadArmed(texture_cache, id),
+              "the fault did not publish the image");
+
+      // A CPU write into the image replaces it: no readback.
+      (void)bind(target);
+      clear(id, 5.5f);
+      counts = TextureCacheTestAccess::Counts(texture_cache);
+      Require(name, "write fault",
+              resources.HandleFault(PageFaultAccess::Write, target + 8),
+              "a write of a protected image page was not resolved");
+      after = TextureCacheTestAccess::Counts(texture_cache);
+      Require(name, "write fault ownership",
+              !TextureCacheTestAccess::ReadArmed(texture_cache, id) &&
+                  protected_pages(target, 0) && after.readbacks == counts.readbacks &&
+                  texture_cache.GetImage(id).IsCpuDirty() &&
+                  guest_holds(target, 4.5f) && valid(),
+              "a CPU write into the image read it back or kept it protected");
+
+      // A CPU write next to an image on its page publishes the image first. Render targets
+      // start on a tile boundary: the image that shares its first page is made by hand.
+      const auto neighbor = base + 0x40100;
+      auto neighbor_info = target_info;
+      neighbor_info.data.address = neighbor;
+      const auto neighbor_id =
+          TextureCacheTestAccess::InsertImage(texture_cache, neighbor_info);
+      clear(neighbor_id, 7.5f);
+      Require(name, "shared page protection",
+              TextureCacheTestAccess::ReadArmed(texture_cache, neighbor_id) &&
+                  TextureCacheTestAccess::Watchers(texture_cache, base + 0x40000)
+                          .image_read == 1,
+              "the page the image shares was not protected");
+      counts = TextureCacheTestAccess::Counts(texture_cache);
+      Require(name, "shared page write",
+              resources.HandleFault(PageFaultAccess::Write, base + 0x40010),
+              "a write next to a protected image was not resolved");
+      after = TextureCacheTestAccess::Counts(texture_cache);
+      Require(name, "shared page publication",
+              !TextureCacheTestAccess::ReadArmed(texture_cache, neighbor_id) &&
+                  guest_holds(neighbor, 7.5f) &&
+                  after.readbacks == counts.readbacks + 1 &&
+                  !texture_cache.GetImage(neighbor_id).IsDefinitelyCpuDirty() &&
+                  valid(),
+              "a write next to the image lost its GPU contents");
+
+      // An image freed while its readback is in flight is not published.
+      (void)bind(target);
+      clear(id, 6.5f);
+      const auto freed = TextureCacheTestAccess::PrepareFault(texture_cache, target);
+      Require(name, "in-flight readback", freed.size() == 1,
+              "the fault recorded no readback");
+      counts = TextureCacheTestAccess::Counts(texture_cache);
+      TextureCacheTestAccess::FreeImage(texture_cache, id);
+      TextureCacheTestAccess::Publish(texture_cache, freed.front());
+      after = TextureCacheTestAccess::Counts(texture_cache);
+      Require(name, "freed image",
+              after.published == counts.published && protected_pages(target, 0) &&
+                  TextureCacheTestAccess::TicketsFree(texture_cache) && valid(),
+              "a freed image was published or kept its protection");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      Require(name, "unmap", valid() && protected_pages(neighbor, 0),
+              "unmapping left image read protection behind");
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "fault readback mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "fault readback allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -45612,6 +45978,12 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-cpu-readback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckFaultImageReadback();
+    vulkan.CheckUnifiedTextureCacheFlow();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledColorViews();
@@ -45762,6 +46134,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();
+    vulkan.CheckFaultImageReadback();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckBgra16Readback();

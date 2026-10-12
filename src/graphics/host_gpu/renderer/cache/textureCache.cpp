@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -14,12 +15,16 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -34,6 +39,12 @@ namespace {
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
+
+[[nodiscard]] bool IsSmallTiled(const ImageInfo& info) {
+	const auto texels = static_cast<uint64_t>(info.extent.width) * info.extent.height *
+	                    info.extent.depth * info.resources.layers;
+	return info.IsTiled() && texels <= SmallTiledReadbackTexels;
+}
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -124,7 +135,16 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
-      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
+      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
+      m_small_tiled_readback(Config::GetImageCpuReadback() == Config::ImageCpuReadback::Small ||
+                             Config::GetImageCpuReadback() == Config::ImageCpuReadback::FaultSmall),
+      m_fault_readback(Config::GetImageCpuReadback() == Config::ImageCpuReadback::Fault ||
+                       Config::GetImageCpuReadback() == Config::ImageCpuReadback::FaultSmall),
+      m_fault_readback_max(Config::GetImageReadbackMax()) {
+	if (const char* stats = std::getenv("KYTY_IMAGE_READBACK_STATS");
+	    stats != nullptr && std::strcmp(stats, "0") != 0) {
+		m_readback_stats_enabled = true;
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -237,6 +257,17 @@ void TextureCache::UnregisterImage(ImageId id) {
 		return;
 	}
 	UntrackImage(id);
+	if (image.read_arm.ticket >= 0) {
+		// The readback in flight must not touch the slot, which may be reused.
+		auto& ticket = m_readback_tickets[static_cast<uint32_t>(image.read_arm.ticket)];
+		for (uint32_t index = 0; index < ticket.count; index++) {
+			if (ticket.entries[index].id == id) {
+				ticket.entries[index].valid = false;
+			}
+		}
+		image.read_arm.ticket = -1;
+	}
+	DisarmImageRead(image);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: registered image is outside the guest address space\n");
@@ -438,6 +469,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 		image.SetMaybeCpuHash(image.HashGuestEdges());
 	}
 	UntrackImage(id);
+	ReconcileImageRead(image);
 }
 
 void TextureCache::TrackImage(ImageId id) {
@@ -551,11 +583,9 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	// Small tiled targets are written back too: games read GPU results such as reductions and
 	// simulation state from them on the CPU (PPSA04263 keeps the origin of its ocean wave grid
 	// in a 1x1 R32G32 target, and its water physics read it to sample the wave heights).
-	const auto& info   = image.info;
-	const auto  texels = static_cast<uint64_t>(info.extent.width) * info.extent.height *
-	                     info.extent.depth * info.resources.layers;
+	const auto& info = image.info;
 	if (m_readback_linear_images && !info.data.Empty() &&
-	    (!info.IsTiled() || texels <= SmallTiledReadbackTexels)) {
+	    (!info.IsTiled() || (m_small_tiled_readback && IsSmallTiled(info)))) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
@@ -743,6 +773,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	if (source.IsBufferModified()) {
 		if (source.info.data == destination.info.data) {
 			destination.MarkBufferModified();
+			ReconcileImageRead(destination);
 		}
 		return;
 	}
@@ -765,10 +796,11 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
 	}
+	destination.ClearBufferModified();
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
+		NoteGpuWrite(destination);
 	}
-	destination.ClearBufferModified();
 }
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
@@ -786,6 +818,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	destination.CopyMip(source, mip, layer);
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
+		NoteGpuWrite(destination);
 	}
 }
 
@@ -930,6 +963,7 @@ bool Publish(TextureCache& cache, Image& image) {
 	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
 	image.ClearGpuModified();
 	image.MarkBufferModified();
+	cache.ReconcileImageRead(image);
 	return true;
 }
 
@@ -947,6 +981,7 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 		}
 		if (merged) {
 			merged->MarkBufferModified();
+			cache.ReconcileImageRead(*merged);
 		}
 	}
 	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
@@ -1209,6 +1244,8 @@ void TextureCache::InitializeImage(ImageId id) {
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
+		// The image holds the guest bytes now.
+		image.read_arm.synced = true;
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
@@ -1226,6 +1263,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
+		ReconcileImageRead(image);
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || desc.info.resources.levels != 1) {
@@ -1318,7 +1356,11 @@ void TextureCache::RefreshImage(ImageId id) {
 			image.SetMaybeCpuHash(hash);
 			return;
 		}
-		(void)image.ResolveMaybeCpuHash(hash);
+		if (!image.ResolveMaybeCpuHash(hash) && !image.read_arm.synced && image.IsGpuModified() &&
+		    image.read_arm.serial == 0 && CanArmImageRead(image)) {
+			// The CPU did not write the image after all: its guest bytes are as stale as before.
+			ArmImageRead(image);
+		}
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
@@ -1384,6 +1426,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
+		ReconcileImageRead(record);
 	}
 
 	return association;
@@ -1721,6 +1764,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		image.RefreshComplete();
 	}
 	image.MarkGpuModified();
+	NoteGpuWrite(image);
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -1884,6 +1928,17 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
+	if (m_fault_readback && m_page_manager.MayHaveImageReadWatch(address, size)) {
+		// A CPU write to a page of protected images it does not write: publish them first, the
+		// write is about to make the page writable. The images it writes become CPU dirty below.
+		for (auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE); page < address + size;
+		     page += TRACKER_PAGE_SIZE) {
+			if (m_page_manager.MayHaveImageReadWatch(page, TRACKER_PAGE_SIZE)) {
+				m_readback_stats.write_faults.fetch_add(1, std::memory_order_relaxed);
+				ResolveImageReadFault(page, address, size);
+			}
+		}
+	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
 }
@@ -2017,6 +2072,39 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
+bool TextureCache::RecordImageReadback(Image& image, Buffer& destination, uint64_t offset,
+                                       uint8_t* mapped) {
+	const auto range = image.info.data;
+	// Bytes of the range the image does not cover (padding) keep their guest values.
+	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
+		return false;
+	}
+	destination.Flush(offset, range.size);
+	DownloadImage(image, destination, offset, range.size, image.info.resources.levels);
+	return true;
+}
+
+namespace {
+
+void RecordHostReadBarrier(CommandScheduler& scheduler, vk::Buffer buffer, uint64_t offset,
+                           uint64_t size) {
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
+	                        vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = buffer;
+	barrier.offset              = offset;
+	barrier.size                = size;
+	scheduler.EndRendering();
+	scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                             vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+	                                             1, &barrier, 0, nullptr);
+}
+
+} // namespace
+
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
@@ -2033,25 +2121,10 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		EXIT("TextureCache: failed to map reusable download buffer\n");
 	}
 	download.Commit();
-	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
+	if (!RecordImageReadback(image, download, offset, mapped)) {
 		return false;
 	}
-	download.Flush(offset, range.size);
-
-	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
-	vk::BufferMemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
-	                        vk::AccessFlagBits::eShaderWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = download.Handle();
-	barrier.offset              = offset;
-	barrier.size                = range.size;
-	m_scheduler.EndRendering();
-	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
-	                                               1, &barrier, 0, nullptr);
+	RecordHostReadBarrier(m_scheduler, download.Handle(), offset, range.size);
 	m_scheduler.DeferPriorityOperation(
 	    [&download, range, mapped, offset] {
 		    download.Invalidate(offset, range.size);
@@ -2059,6 +2132,448 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	    },
 	    range.address, range.size);
 	return true;
+}
+
+// Read protection of GPU-written images.
+//
+// The guest bytes of a GPU-written image are stale until a readback writes them back. In the
+// fault modes, the pages of every GPU-written tiled image the tiler can write back are read
+// protected (no access) when the GPU write is recorded, on the execution thread: always before
+// the label or end-of-pipe write after it, which the execution thread writes as it records. A
+// CPU access of the pages faults: the faulting thread asks the execution thread (lock-free, it
+// does not wait for the GPU) to record a readback of the protected images of the page into a
+// ticket and submit it, waits for the GPU itself, writes the image bytes into the guest memory
+// and lifts the protection. Concurrent faults on the same images share the ticket. An image the
+// GPU keeps rewriting and the CPU never reads stays protected: no fault and no protection change
+// per frame. One the CPU reads is protected again by its next GPU write.
+//
+// While the protection lasts, nothing writes the guest bytes of the image but its own readback:
+// a CPU write faults first (and makes the image CPU dirty, which lifts the protection), the
+// backing writes of buffer readbacks and asynchronous image downloads cover memory whose image is
+// not protected, or an older publication that the readback waits for.
+
+bool TextureCache::CanArmImageRead(Image& image) {
+	const auto& info = image.info;
+	if (!m_fault_readback || !image.registered || image.depth_id ||
+	    image.backing.image == nullptr || info.data.Empty() || !info.IsTiled() ||
+	    info.IsDepth() || info.HasStencil() || !image.SafeToDownload()) {
+		return false;
+	}
+	if (m_small_tiled_readback && IsSmallTiled(info)) {
+		// Downloaded on every frame instead.
+		return false;
+	}
+	if (image.read_arm.tiling == 0) {
+		const bool supported = info.data.size <= m_fault_readback_max && CanDownload(image) &&
+		                       m_tiler.CanTile(info);
+		image.read_arm.tiling = supported ? 1 : 2;
+		if (!supported) {
+			m_readback_stats.rejected.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	return image.read_arm.tiling == 1 && CanDownload(image);
+}
+
+void TextureCache::ArmImageRead(Image& image) {
+	if (image.read_arm.serial != 0) {
+		return;
+	}
+	const auto before = PageManager::ImageProtectionCalls();
+	m_page_manager.UpdateImageReadWatchers<true>(image.info.data.address, image.info.data.size);
+	m_readback_stats.protections.fetch_add(PageManager::ImageProtectionCalls() - before,
+	                                       std::memory_order_relaxed);
+	image.read_arm.address = image.info.data.address;
+	image.read_arm.size    = image.info.data.size;
+	image.read_arm.serial  = ++m_read_arm_serial;
+	m_readback_stats.arms.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TextureCache::DisarmImageRead(Image& image) {
+	if (image.read_arm.serial == 0) {
+		return;
+	}
+	const auto before = PageManager::ImageProtectionCalls();
+	m_page_manager.UpdateImageReadWatchers<false>(image.read_arm.address, image.read_arm.size);
+	m_readback_stats.protections.fetch_add(PageManager::ImageProtectionCalls() - before,
+	                                       std::memory_order_relaxed);
+	image.read_arm.serial = 0;
+	m_readback_stats.disarms.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TextureCache::NoteGpuWrite(Image& image) {
+	image.read_arm.gpu_writes++;
+	image.read_arm.synced = false;
+	if (image.read_arm.serial != 0 || !CanArmImageRead(image)) {
+		return;
+	}
+	// An image whose GPU writes a GPU buffer write or a CPU write keeps replacing before the CPU
+	// reads them would be protected and released again on every frame (two protection changes
+	// of its pages per frame): it stays unprotected while the replacements go on, and is
+	// protected again within a couple of frames after they stop.
+	constexpr uint8_t  DormantOverwrites = 3;
+	constexpr uint64_t DormantTicks      = 2;
+	if (image.read_arm.overwrites >= DormantOverwrites) {
+		if (m_gc_tick - image.read_arm.overwrite_tick <= DormantTicks) {
+			m_readback_stats.dormant.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		image.read_arm.overwrites = 0;
+	}
+	ArmImageRead(image);
+}
+
+void TextureCache::NoteImageOverwrite(Image& image) {
+	if (m_fault_readback) {
+		if (image.read_arm.overwrites != UINT8_MAX) {
+			image.read_arm.overwrites++;
+		}
+		image.read_arm.overwrite_tick = m_gc_tick;
+	}
+}
+
+void TextureCache::ReconcileImageRead(Image& image) {
+	// Only ever lifts protection: this runs in the CPU's fault paths, where protecting the pages
+	// again would fault the access forever.
+	if (image.read_arm.serial != 0 && !CanArmImageRead(image)) {
+		DisarmImageRead(image);
+		m_readback_stats.unpublished.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+TextureCache::ReadbackTicket::ReadbackTicket()  = default;
+TextureCache::ReadbackTicket::~ReadbackTicket() = default;
+
+void TextureCache::ResolveImageReadFault(uint64_t address, uint64_t skip_address,
+                                         uint64_t skip_size) {
+	if (!m_fault_readback) {
+		return;
+	}
+	const auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	if (!m_page_manager.MayHaveImageReadWatch(page, TRACKER_PAGE_SIZE)) {
+		return;
+	}
+	auto*      gpu       = m_scheduler.Context().TryGetGpu();
+	const bool execution = gpu == nullptr || GuestGpu::IsGpuThread();
+	if (!execution && CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported image readback from an asynchronous GPU completion, addr=0x%016" PRIx64
+		     "\n",
+		     address);
+	}
+	(execution ? m_readback_stats.gpu_thread_faults : m_readback_stats.faults)
+	    .fetch_add(1, std::memory_order_relaxed);
+	if (m_lock.HeldByCurrentThread()) {
+		// A fault inside a critical section of the cache (GPU thread): no readback can be recorded
+		// here. Lift the protection without publishing; the CPU sees the bytes it saw before.
+		const auto skip_end = skip_address + skip_size;
+		for (const auto id: FindImagesInRegion(page, TRACKER_PAGE_SIZE, true)) {
+			auto* image = m_slot_images.try_get(id);
+			if (image != nullptr && image->read_arm.serial != 0 &&
+			    (skip_size == 0 || !image->Overlaps(skip_address, skip_end - skip_address))) {
+				DisarmImageRead(*image);
+				m_readback_stats.unpublished.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		return;
+	}
+	Common::SpinBackoff backoff;
+	for (;;) {
+		ImageReadFault fault;
+		fault.cache      = this;
+		fault.page       = page;
+		fault.skip_begin = skip_address;
+		fault.skip_end   = skip_size != 0 ? skip_address + skip_size : skip_address;
+		fault.execution  = execution;
+		if (execution) {
+			PrepareImageReadback(fault);
+		} else {
+			gpu->SendUrgentCommandSpin(
+			    [](void* context) {
+				    auto* request = static_cast<ImageReadFault*>(context);
+				    request->cache->PrepareImageReadback(*request);
+			    },
+			    &fault);
+		}
+		for (uint32_t index = 0; index < fault.ticket_count; index++) {
+			PublishImageReadback(fault.tickets[index]);
+		}
+		if (!fault.more) {
+			break;
+		}
+		if (fault.ticket_count == 0) {
+			// Every ticket is in flight: they free up as the GPU reaches them.
+			backoff.Spin();
+		}
+	}
+}
+
+void TextureCache::PrepareImageReadback(ImageReadFault& fault) {
+	std::array<ImageId, TicketImages> pending {};
+	uint32_t                          pending_count = 0;
+	uint32_t                          ticket_index  = UINT32_MAX;
+	{
+		std::scoped_lock lock {m_lock};
+		bool skipped = false;
+		for (const auto id: FindImagesInRegion(fault.page, TRACKER_PAGE_SIZE, true)) {
+			auto* image = m_slot_images.try_get(id);
+			if (image == nullptr || image->read_arm.serial == 0) {
+				continue;
+			}
+			if (fault.skip_end != fault.skip_begin &&
+			    image->Overlaps(fault.skip_begin, fault.skip_end - fault.skip_begin)) {
+				skipped = true;
+				continue;
+			}
+			if (const auto shared = image->read_arm.ticket; shared >= 0) {
+				// A readback of the image is in flight: wait for it too.
+				const auto index = static_cast<uint32_t>(shared);
+				const auto known = std::find(fault.tickets.begin(),
+				                             fault.tickets.begin() + fault.ticket_count, index);
+				if (known != fault.tickets.begin() + fault.ticket_count) {
+					continue;
+				}
+				if (fault.ticket_count == FaultTickets) {
+					fault.more = true;
+					continue;
+				}
+				m_readback_tickets[index].holders.fetch_add(1, std::memory_order_acq_rel);
+				fault.tickets[fault.ticket_count++] = index;
+				m_readback_stats.shared.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			if (pending_count == TicketImages) {
+				fault.more = true;
+				continue;
+			}
+			pending[pending_count++] = id;
+		}
+		if (pending_count == 0 && fault.ticket_count == 0 && !fault.more && !skipped &&
+		    m_page_manager.Watchers(fault.page).image_read != 0) {
+			// Protected for an image the page index does not list on the page (which it should):
+			// lift that protection rather than fault on the page forever.
+			m_slot_images.ForEach([&](ImageId, Image& image) {
+				if (image.read_arm.serial != 0 &&
+				    ImagePageRangesOverlap(image.read_arm.address, image.read_arm.size,
+				                           fault.page, TRACKER_PAGE_SIZE)) {
+					DisarmImageRead(image);
+					m_readback_stats.unpublished.fetch_add(1, std::memory_order_relaxed);
+				}
+			});
+			static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+			if (!logged.test_and_set()) {
+				LOGF_COLOR(Log::Color::BrightYellow,
+				           "TextureCache: page 0x%016" PRIx64
+				           " was read protected for an unlisted image\n",
+				           fault.page);
+			}
+		}
+		if (pending_count == 0) {
+			return;
+		}
+		if (fault.ticket_count == FaultTickets) {
+			fault.more = true;
+			return;
+		}
+		// The execution thread's own faults keep a ticket of their own; the others take the first
+		// free one. Only this function allocates tickets, under the lock.
+		const auto is_free = [this](uint32_t index) {
+			return m_readback_tickets[index].state.load(std::memory_order_acquire) ==
+			       ReadbackTicket::Free;
+		};
+		if (fault.execution && is_free(ExecutionTicket)) {
+			ticket_index = ExecutionTicket;
+		} else {
+			for (uint32_t index = 0; index < ReadbackTicketCount; index++) {
+				if (is_free(index)) {
+					ticket_index = index;
+					break;
+				}
+			}
+		}
+		if (ticket_index == UINT32_MAX) {
+			fault.more = true;
+			return;
+		}
+		auto&    ticket = m_readback_tickets[ticket_index];
+		uint64_t total  = 0;
+		std::array<uint64_t, TicketImages> offsets {};
+		for (uint32_t index = 0; index < pending_count; index++) {
+			offsets[index] = Common::AlignUp(total, 256);
+			total          = offsets[index] + m_slot_images[pending[index]].info.data.size;
+		}
+		if (!ticket.buffer || ticket.buffer->Size() < total) {
+			// A free ticket's buffer is idle: the GPU passed its tick and it was published.
+			ticket.buffer.reset();
+			ticket.buffer = std::make_unique<Buffer>(
+			    m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags,
+			    std::max<uint64_t>(Common::AlignUp(total, 64 * 1024), 256 * 1024));
+		}
+		auto* mapped = ticket.buffer->Mapped().data();
+		EXIT_IF(mapped == nullptr);
+		ticket.count = 0;
+		for (uint32_t index = 0; index < pending_count; index++) {
+			auto& image = m_slot_images[pending[index]];
+			if (!RecordImageReadback(image, *ticket.buffer, offsets[index], mapped + offsets[index])) {
+				DisarmImageRead(image);
+				m_readback_stats.unpublished.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			ticket.entries[ticket.count++] = {
+			    .id         = pending[index],
+			    .serial     = image.read_arm.serial,
+			    .gpu_writes = image.read_arm.gpu_writes,
+			    .address    = image.info.data.address,
+			    .size       = image.info.data.size,
+			    .offset     = offsets[index],
+			    .valid      = true,
+			};
+			image.read_arm.ticket = static_cast<int32_t>(ticket_index);
+		}
+		if (ticket.count == 0) {
+			return;
+		}
+		RecordHostReadBarrier(m_scheduler, ticket.buffer->Handle(), 0, total);
+		ticket.holders.store(1, std::memory_order_relaxed);
+		ticket.tick = m_scheduler.CurrentTick();
+		// Holds it until the end of this function: the caller publishes it.
+		ticket.state.store(ReadbackTicket::Recorded, std::memory_order_relaxed);
+	}
+	// Submit now: the faulting thread waits for these commands, not for a later flush.
+	m_scheduler.Flush();
+	fault.tickets[fault.ticket_count++] = ticket_index;
+	m_readback_stats.readbacks.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TextureCache::PublishImageReadback(uint32_t ticket_index) {
+	auto&      ticket = m_readback_tickets[ticket_index];
+	auto&      master = m_scheduler.GetMasterSemaphore();
+	const auto start  = std::chrono::steady_clock::now();
+	Common::SpinBackoff backoff;
+	while (!master.IsFree(ticket.tick)) {
+		master.Refresh();
+		if (!master.IsFree(ticket.tick)) {
+			backoff.Spin();
+		}
+	}
+	uint32_t expected = ReadbackTicket::Recorded;
+	if (ticket.state.compare_exchange_strong(expected, ReadbackTicket::Publishing,
+	                                         std::memory_order_acq_rel)) {
+		// An older asynchronous publication of these bytes must not land after this one.
+		if (!CommandScheduler::InDeferredOperation()) {
+			for (uint32_t index = 0; index < ticket.count; index++) {
+				const auto& entry = ticket.entries[index];
+				if (m_scheduler.HasPendingGuestOperations(entry.address, entry.size)) {
+					m_scheduler.WaitPriorityOperations(ticket.tick);
+					m_readback_stats.priority_waits.fetch_add(1, std::memory_order_relaxed);
+					break;
+				}
+			}
+		}
+		const auto* mapped = ticket.buffer->Mapped().data();
+		{
+			std::scoped_lock lock {m_lock};
+			for (uint32_t index = 0; index < ticket.count; index++) {
+				const auto& entry = ticket.entries[index];
+				if (!entry.valid) {
+					continue;
+				}
+				auto* image = m_slot_images.try_get(entry.id);
+				if (image == nullptr ||
+				    image->read_arm.ticket != static_cast<int32_t>(ticket_index)) {
+					continue;
+				}
+				image->read_arm.ticket = -1;
+				if (image->read_arm.serial != entry.serial) {
+					// The protection was lifted since (a CPU write), maybe set again.
+					continue;
+				}
+				if (!image->SafeToDownload()) {
+					DisarmImageRead(*image);
+					m_readback_stats.unpublished.fetch_add(1, std::memory_order_relaxed);
+					continue;
+				}
+				ticket.buffer->Invalidate(entry.offset, entry.size);
+				LibKernel::Memory::WriteBacking(entry.address, mapped + entry.offset, entry.size);
+				m_readback_stats.published.fetch_add(1, std::memory_order_relaxed);
+				m_readback_stats.published_bytes.fetch_add(entry.size, std::memory_order_relaxed);
+				image->read_arm.overwrites = 0;
+				if (image->read_arm.gpu_writes == entry.gpu_writes) {
+					image->read_arm.synced = true;
+					DisarmImageRead(*image);
+				} else {
+					// The GPU wrote the image again after the readback was recorded: the published
+					// bytes are older than the image, keep the protection for the next access.
+					m_readback_stats.kept.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+		}
+		ticket.state.store(ReadbackTicket::Done, std::memory_order_release);
+	} else {
+		while (ticket.state.load(std::memory_order_acquire) != ReadbackTicket::Done) {
+			backoff.Spin();
+		}
+	}
+	m_readback_stats.wait_us.fetch_add(
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                              std::chrono::steady_clock::now() - start)
+	                              .count()),
+	    std::memory_order_relaxed);
+	if (ticket.holders.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+		ticket.state.store(ReadbackTicket::Free, std::memory_order_release);
+	}
+}
+
+void TextureCache::LogImageReadbackStats() {
+	m_readback_stats_frames++;
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	if (m_readback_stats_time == 0) {
+		m_readback_stats_time = now;
+		return;
+	}
+	if (now - m_readback_stats_time < 5000) {
+		return;
+	}
+	const auto& stats  = m_readback_stats;
+	const auto  frames = std::max<uint64_t>(m_readback_stats_frames, 1);
+	const auto  load   = [](const std::atomic<uint64_t>& value) {
+        return value.load(std::memory_order_relaxed);
+	};
+	uint64_t armed = 0;
+	m_slot_images.ForEach([&](ImageId, const Image& image) {
+		armed += image.read_arm.serial != 0 ? 1 : 0;
+	});
+	std::printf("ImageReadback: %.1f s %" PRIu64 " frames: armed=%" PRIu64 " arms=%" PRIu64
+	            " disarms=%" PRIu64 " protections=%" PRIu64 " (%.2f/frame) faults=%" PRIu64
+	            " gpu-thread=%" PRIu64 " readbacks=%" PRIu64 " shared=%" PRIu64
+	            " published=%" PRIu64 " (%.1f KiB) kept=%" PRIu64 " unpublished=%" PRIu64
+	            " rejected=%" PRIu64 " dormant=%" PRIu64 " priority-waits=%" PRIu64
+	            " wait=%.2f ms (%.1f us/publish)\n",
+	            static_cast<double>(now - m_readback_stats_time) / 1000.0, frames, armed,
+	            load(stats.arms), load(stats.disarms), load(stats.protections),
+	            static_cast<double>(load(stats.protections)) / static_cast<double>(frames),
+	            load(stats.faults), load(stats.gpu_thread_faults), load(stats.readbacks),
+	            load(stats.shared), load(stats.published),
+	            static_cast<double>(load(stats.published_bytes)) / 1024.0, load(stats.kept),
+	            load(stats.unpublished), load(stats.rejected), load(stats.dormant),
+	            load(stats.priority_waits),
+	            static_cast<double>(load(stats.wait_us)) / 1000.0,
+	            static_cast<double>(load(stats.wait_us)) /
+	                static_cast<double>(std::max<uint64_t>(
+	                    load(stats.readbacks) + load(stats.shared), 1)));
+	std::fflush(stdout);
+	for (auto* counter: {&m_readback_stats.arms, &m_readback_stats.disarms,
+	                     &m_readback_stats.rejected, &m_readback_stats.faults,
+	                     &m_readback_stats.gpu_thread_faults, &m_readback_stats.write_faults,
+	                     &m_readback_stats.unpublished, &m_readback_stats.readbacks,
+	                     &m_readback_stats.shared, &m_readback_stats.published,
+	                     &m_readback_stats.published_bytes, &m_readback_stats.kept,
+	                     &m_readback_stats.wait_us, &m_readback_stats.priority_waits,
+	                     &m_readback_stats.protections, &m_readback_stats.dormant}) {
+		counter->store(0, std::memory_order_relaxed);
+	}
+	m_readback_stats_time   = now;
+	m_readback_stats_frames = 0;
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
@@ -2075,6 +2590,8 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 			image.ClearGpuModified();
 		}
 		image.MarkBufferModified();
+		NoteImageOverwrite(image);
+		ReconcileImageRead(image);
 	}
 }
 
@@ -2106,6 +2623,10 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 		if (owner->Overlaps(address, size)) {
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id);
+			if (owner->IsGpuModified()) {
+				NoteImageOverwrite(*owner);
+			}
+			ReconcileImageRead(*owner);
 			continue;
 		}
 		const auto image_begin = owner->info.data.address;
@@ -2254,6 +2775,10 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
+	if (m_readback_stats_enabled) {
+		std::scoped_lock lock {m_lock};
+		LogImageReadbackStats();
+	}
 	if (!m_readback_linear_images) {
 		return;
 	}

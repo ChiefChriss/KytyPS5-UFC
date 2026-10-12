@@ -85,6 +85,8 @@ public:
 	// Copies guest memory into the mapped stream buffer, possibly on the host copy thread (see
 	// CommandScheduler::HostCopies()).
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
+	// Copies guest memory the CPU may have written, on the execution thread.
+	void CopyGuestBytes(uint8_t* destination, uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	// Fills memory the emulator itself rewrites, such as consumed color metadata, without
 	// invalidating images over it. Memory the GPU owns is filled on the GPU, so the fill never
@@ -279,6 +281,7 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
+	PageManager&                                      m_page_manager;
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                           m_gpu_write_generation = 0;
 	WriteTicks                                        m_write_ticks;

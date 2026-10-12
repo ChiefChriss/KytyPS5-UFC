@@ -90,15 +90,23 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+using WatchKind = PageManager::WatchKind;
+
+// Address-space protection changes, all and those of image read watchers, for statistics.
+std::atomic<uint64_t> g_protection_calls {0};
+std::atomic<uint64_t> g_image_protection_calls {0};
+
 } // namespace
 
 struct PageManager::Impl {
 	struct PageState {
 		uint8_t write_watchers  : 7 = 0;
 		uint8_t access_watchers : 1 = 0;
+		// GPU-written images whose guest bytes on the page are stale: any number may share a page.
+		uint8_t image_read_watchers = 0;
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
-			if (access_watchers != 0) {
+			if (access_watchers != 0 || image_read_watchers != 0) {
 				return Common::VirtualMemory::Mode::NoAccess;
 			}
 			if (write_watchers != 0) {
@@ -107,10 +115,14 @@ struct PageManager::Impl {
 			return Common::VirtualMemory::Mode::ReadWrite;
 		}
 
-		template <int delta, bool is_read>
+		[[nodiscard]] bool Watched() const noexcept {
+			return write_watchers != 0 || access_watchers != 0 || image_read_watchers != 0;
+		}
+
+		template <int delta, WatchKind kind>
 		uint32_t AddDelta(uint64_t address) {
 			static_assert(delta >= -1 && delta <= 1);
-			if constexpr (is_read) {
+			if constexpr (kind == WatchKind::BufferRead) {
 				if constexpr (delta == 1) {
 					if (access_watchers != 0) {
 						Fatal("read-watcher overflow at 0x%016" PRIx64, address);
@@ -123,6 +135,20 @@ struct PageManager::Impl {
 					return --access_watchers;
 				} else {
 					return access_watchers;
+				}
+			} else if constexpr (kind == WatchKind::ImageRead) {
+				if constexpr (delta == 1) {
+					if (image_read_watchers == UINT8_MAX) {
+						Fatal("image read-watcher overflow at 0x%016" PRIx64, address);
+					}
+					return ++image_read_watchers;
+				} else if constexpr (delta == -1) {
+					if (image_read_watchers == 0) {
+						Fatal("image read-watcher underflow at 0x%016" PRIx64, address);
+					}
+					return --image_read_watchers;
+				} else {
+					return image_read_watchers;
 				}
 			} else {
 				if constexpr (delta == 1) {
@@ -141,11 +167,18 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 1);
+	static_assert(sizeof(PageState) == 2);
+
+	static constexpr size_t IMAGE_BIT_WORDS = REGION_PAGES / 64;
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
+		// The pages with image read watchers, written under the lock and read without it. They are
+		// set before the protection is installed and cleared after it is lifted, and live on their
+		// own cache lines: draws read them, only image arming writes them.
+		alignas(64) std::atomic<uint32_t> image_read_pages {0};
+		std::array<std::atomic<uint64_t>, IMAGE_BIT_WORDS> image_read_bits {};
 	};
 
 	Impl() {
@@ -174,7 +207,7 @@ struct PageManager::Impl {
 		for (const auto& region: region_storage) {
 			SpinGuard lock(region->lock);
 			for (auto& page: region->pages) {
-				if (page.write_watchers != 0 || page.access_watchers != 0) {
+				if (page.Watched()) {
 					FailFast("PageManager destroyed with live page state");
 				}
 			}
@@ -203,13 +236,31 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		g_protection_calls.fetch_add(1, std::memory_order_relaxed);
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
 		}
 	}
 
-	template <bool track, bool is_read, bool masked>
+	// Caller holds the region lock.
+	void NoteImageReadPage(Region& region, size_t page_index, bool watched) noexcept {
+		auto&      word = region.image_read_bits[page_index / 64];
+		const auto bit  = uint64_t {1} << (page_index % 64);
+		if (watched) {
+			word.store(word.load(std::memory_order_relaxed) | bit, std::memory_order_release);
+			if (region.image_read_pages.fetch_add(1, std::memory_order_acq_rel) == 0) {
+				image_read_regions.fetch_add(1, std::memory_order_acq_rel);
+			}
+		} else {
+			word.store(word.load(std::memory_order_relaxed) & ~bit, std::memory_order_release);
+			if (region.image_read_pages.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+				image_read_regions.fetch_sub(1, std::memory_order_acq_rel);
+			}
+		}
+	}
+
+	template <bool track, WatchKind kind, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
 		SpinGuard lock(region.lock);
@@ -217,9 +268,14 @@ struct PageManager::Impl {
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
 		uint64_t  potential_range_bytes = 0;
+		// Image pages whose last watcher left: their bits are cleared once access is restored.
+		bool released_image_pages = false;
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
+				if constexpr (kind == WatchKind::ImageRead) {
+					g_image_protection_calls.fetch_add(1, std::memory_order_relaxed);
+				}
 				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
 				range_bytes           = 0;
 				potential_range_bytes = 0;
@@ -232,8 +288,8 @@ struct PageManager::Impl {
 			const bool update  = !masked || mask->Get(page_index);
 
 			const auto old_perms = page.Perms();
-			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
-			                              : page.AddDelta<0, is_read>(address);
+			const auto new_count = update ? page.AddDelta<track ? 1 : -1, kind>(address)
+			                              : page.AddDelta<0, kind>(address);
 			const auto new_perms = page.Perms();
 
 			if (new_perms != perms) [[unlikely]] {
@@ -248,6 +304,12 @@ struct PageManager::Impl {
 			}
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
+			if constexpr (kind == WatchKind::ImageRead) {
+				if (watcher_edge && track) {
+					NoteImageReadPage(region, page_index, true);
+				}
+				released_image_pages |= watcher_edge && !track;
+			}
 			if (watcher_edge && old_perms != new_perms) {
 				if (range_bytes == 0) {
 					range_begin           = page_index;
@@ -258,9 +320,22 @@ struct PageManager::Impl {
 		}
 
 		release_pending();
+
+		if constexpr (kind == WatchKind::ImageRead && !track) {
+			if (released_image_pages) {
+				for (size_t page_index = first; page_index < last; page_index++) {
+					auto&      word = region.image_read_bits[page_index / 64];
+					const auto bit  = uint64_t {1} << (page_index % 64);
+					if (region.pages[page_index].image_read_watchers == 0 &&
+					    (word.load(std::memory_order_relaxed) & bit) != 0) {
+						NoteImageReadPage(region, page_index, false);
+					}
+				}
+			}
+		}
 	}
 
-	template <bool track, bool is_read>
+	template <bool track, WatchKind kind>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 		ValidateRange(vaddr, size);
 		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
@@ -274,17 +349,51 @@ struct PageManager::Impl {
 			}
 			const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
 			const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
-			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last);
+			UpdateRegionWatchers<track, kind, false>(*region, region_base, first, last);
 			chunk_begin = chunk_end;
 		}
+	}
+
+	[[nodiscard]] bool MayHaveImageReadWatch(uint64_t vaddr, uint64_t size) const noexcept {
+		if (image_read_regions.load(std::memory_order_acquire) == 0 || size == 0 ||
+		    vaddr >= ADDRESS_SIZE) {
+			return false;
+		}
+		const auto end = vaddr + std::min(size, ADDRESS_SIZE - vaddr);
+		for (auto chunk_begin = vaddr; chunk_begin < end;) {
+			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+			const auto chunk_end   = std::min(end, region_base + REGION_SIZE);
+			const auto* region     = FindRegion(chunk_begin);
+			if (region != nullptr && region->image_read_pages.load(std::memory_order_acquire) != 0) {
+				const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+				const auto last  = static_cast<size_t>((chunk_end - 1 - region_base) / PAGE_SIZE);
+				for (size_t word = first / 64; word <= last / 64; word++) {
+					auto bits = region->image_read_bits[word].load(std::memory_order_acquire);
+					if (word == first / 64) {
+						bits &= ~uint64_t {0} << (first % 64);
+					}
+					if (word == last / 64 && last % 64 != 63) {
+						bits &= (uint64_t {1} << (last % 64 + 1)) - 1;
+					}
+					if (bits != 0) {
+						return true;
+					}
+				}
+			}
+			chunk_begin = chunk_end;
+		}
+		return false;
 	}
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
 	std::mutex                              region_mutex;
+	// Regions with image read watchers: most calls of MayHaveImageReadWatch() stop at it.
+	alignas(64) std::atomic<uint64_t> image_read_regions {0};
 };
 
 static_assert(std::atomic<void*>::is_always_lock_free);
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
 PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
@@ -301,19 +410,51 @@ bool PageManager::IsWatched(uint64_t vaddr) const {
 	}
 	const auto page = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
 	SpinGuard  lock(region->lock);
-	return region->pages[page].write_watchers != 0 || region->pages[page].access_watchers != 0;
+	return region->pages[page].Watched();
+}
+
+PageManager::PageWatchers PageManager::Watchers(uint64_t vaddr) const {
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return {};
+	}
+	const auto  page = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
+	SpinGuard   lock(region->lock);
+	const auto& state = region->pages[page];
+	return {state.write_watchers, state.access_watchers, state.image_read_watchers};
+}
+
+bool PageManager::MayHaveImageReadWatch(uint64_t vaddr, uint64_t size) const noexcept {
+	return m_impl->MayHaveImageReadWatch(vaddr, size);
+}
+
+uint64_t PageManager::ProtectionCalls() noexcept {
+	return g_protection_calls.load(std::memory_order_relaxed);
+}
+
+uint64_t PageManager::ImageProtectionCalls() noexcept {
+	return g_image_protection_calls.load(std::memory_order_relaxed);
 }
 
 template <bool track>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
-	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
+	m_impl->UpdatePageWatchers<track, WatchKind::Write>(vaddr, size);
 }
 
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
 
+template <bool track>
+void PageManager::UpdateImageReadWatchers(uint64_t vaddr, uint64_t size) {
+	m_impl->UpdatePageWatchers<track, WatchKind::ImageRead>(vaddr, size);
+}
+
+template void PageManager::UpdateImageReadWatchers<true>(uint64_t, uint64_t);
+template void PageManager::UpdateImageReadWatchers<false>(uint64_t, uint64_t);
+
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
+	constexpr auto kind = is_read ? WatchKind::BufferRead : WatchKind::Write;
 	if (base_addr % REGION_SIZE != 0 || base_addr >= ADDRESS_SIZE ||
 	    REGION_SIZE > ADDRESS_SIZE - base_addr) {
 		Fatal("invalid tracking region base 0x%016" PRIx64, base_addr);
@@ -327,8 +468,8 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	const auto first = start_range.first;
 	const auto last  = end_range.second;
 	if (start_range.second == end_range.second) {
-		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE,
-		                                           (last - first) * PAGE_SIZE);
+		m_impl->UpdatePageWatchers<track, kind>(base_addr + first * PAGE_SIZE,
+		                                        (last - first) * PAGE_SIZE);
 		return;
 	}
 
@@ -336,7 +477,7 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	if (region == nullptr) {
 		Fatal("untracking unknown region 0x%016" PRIx64, base_addr);
 	}
-	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask);
+	m_impl->UpdateRegionWatchers<track, kind, true>(*region, base_addr, first, last, &mask);
 }
 
 template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&);

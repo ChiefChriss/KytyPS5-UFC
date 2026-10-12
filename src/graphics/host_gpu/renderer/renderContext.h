@@ -42,6 +42,7 @@ public:
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
+	[[nodiscard]] GuestGpu*                 TryGetGpu() const noexcept { return m_gpu.get(); }
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
@@ -59,6 +60,9 @@ public:
 	// Before the emulated GPU writes guest memory (labels, WRITE_DATA): resolves a tracked page
 	// as its write fault would, without raising the exception.
 	void PrepareGpuWrite(const void* destination, uint64_t size) noexcept;
+	// Before the host reads guest memory outside guest instructions (a system call writing it to a
+	// file): resolves the read-protected pages as their read faults would.
+	void PrepareHostRead(const void* source, uint64_t size) noexcept;
 	// Execution thread, before each operation (see PrepareBda()).
 	void NoteOperation(uint64_t submit_id, bool after_wait) noexcept {
 		if (submit_id != m_bda_submit || after_wait) {

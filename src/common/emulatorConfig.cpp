@@ -164,6 +164,14 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
+ImageCpuReadback GetImageCpuReadback() {
+	return g_config->image_cpu_readback;
+}
+
+uint64_t GetImageReadbackMax() {
+	return g_config->image_readback_max;
+}
+
 bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }

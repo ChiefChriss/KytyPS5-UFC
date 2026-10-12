@@ -53,6 +53,11 @@ public:
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
 	}
+	// Whether the calling thread holds the lock: a fault it takes in a critical section cannot
+	// take the lock again.
+	[[nodiscard]] bool HeldByCurrentThread() const noexcept {
+		return m_owner.load(std::memory_order_relaxed) == CurrentThread();
+	}
 
 private:
 	static uint32_t CurrentThread() noexcept {

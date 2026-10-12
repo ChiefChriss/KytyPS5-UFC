@@ -27,6 +27,11 @@ enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
+// How GPU-written tiled images reach the guest CPU: never (Off), small ones on every frame
+// (Small), on the CPU's first read of their pages (Fault), or both (FaultSmall: small ones on
+// every frame, larger ones on a read).
+enum class ImageCpuReadback { Off, Small, Fault, FaultSmall };
+
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
@@ -88,6 +93,9 @@ struct ConfigOptions {
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = true;
+	ImageCpuReadback       image_cpu_readback          = ImageCpuReadback::Small;
+	// Larger GPU-written images are not read back on a CPU read (Fault modes).
+	uint64_t               image_readback_max          = 4ull * 1024 * 1024;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = true;
 	bool                   async_pipelines_enabled     = true;
@@ -146,6 +154,8 @@ bool GpuAssistedValidationEnabled();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
+ImageCpuReadback GetImageCpuReadback();
+uint64_t         GetImageReadbackMax();
 bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 // Draws whose new pipeline the driver is still compiling are skipped instead of waiting for it.

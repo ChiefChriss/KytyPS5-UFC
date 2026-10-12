@@ -239,7 +239,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
-      m_memory_tracker(page_manager),
+      m_page_manager(page_manager), m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
@@ -550,7 +550,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			CopyGuestBytes(mapped + copy.srcOffset, address, copy.size);
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -561,8 +561,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
+		CopyGuestBytes(temporary->Mapped().data() + copy.srcOffset, address, copy.size);
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();
@@ -582,6 +581,17 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 			copies->Copy(destination, source, size);
 			return;
 		}
+	}
+	CopyGuestBytes(destination, vaddr, size);
+}
+
+void BufferCache::CopyGuestBytes(uint8_t* destination, uint64_t vaddr, uint64_t size) {
+	// Pages of GPU-written images may be read protected (see TextureCache::ArmImageRead()). Their
+	// guest bytes are stale either way, and the backing store holds the same bytes without
+	// faulting in the middle of a draw, where tracking locks may be held.
+	if (m_page_manager.MayHaveImageReadWatch(vaddr, size) &&
+	    Libs::LibKernel::Memory::TryReadBacking(vaddr, destination, size)) {
+		return;
 	}
 	std::memcpy(destination, reinterpret_cast<const void*>(vaddr), size);
 }

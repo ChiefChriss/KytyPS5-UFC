@@ -160,6 +160,27 @@ public:
 	// Bindless table bindings that keep binding the image without looking it up again (see
 	// TextureCache::PinImage()).
 	uint32_t         table_pins         = 0;
+	// CPU-read protection of the guest pages of a GPU-written image whose guest bytes are stale
+	// (see TextureCache::ArmImageRead()); TextureCache state, under its lock.
+	struct ReadArm {
+		// Nonzero while the pages are protected: names one arming of the image.
+		uint64_t serial  = 0;
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		// Advances with every GPU write of the image, so that a readback recorded before a newer
+		// write keeps the protection after it is published.
+		uint64_t gpu_writes = 0;
+		// The fault readback of the image in flight, or -1.
+		int32_t  ticket     = -1;
+		// Whether the tiler can write the image's guest layout: 0 unknown, 1 yes, 2 no.
+		uint8_t  tiling     = 0;
+		// The guest bytes hold the image's last GPU write (a readback published it).
+		bool     synced     = false;
+		// GPU writes of the image that a GPU buffer write or a CPU write replaced before any CPU
+		// read (saturating), and the garbage collection tick of the last one.
+		uint8_t  overwrites     = 0;
+		uint64_t overwrite_tick = 0;
+	} read_arm;
 
 private:
 	friend struct ImageTestAccess;

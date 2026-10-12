@@ -11,6 +11,7 @@
 
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string_view>
 #include <vector>
@@ -90,6 +91,12 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf("  --readback-linear-images <true|false> Read back writable linear images on submit\n"
 	         "                                       (default: true).\n");
+	::printf("  --image-cpu-readback <mode>          How GPU-written tiled images reach the CPU: off,\n"
+	         "                                       small (small ones every frame), fault (on a\n"
+	         "                                       CPU read of their pages) or fault+small.\n"
+	         "                                       Default: small.\n");
+	::printf("  --image-readback-max <bytes>         Largest image the fault modes read back\n"
+	         "                                       (default: 4194304).\n");
 	::printf(
 	    "  --sync-raw-image-buffers <true|false> Synchronize raw reads of GPU images. Default: false.\n");
 	::printf(
@@ -481,6 +488,27 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--image-cpu-readback") {
+			if (Common::EqualNoCase(value, "off")) {
+				options.config.image_cpu_readback = Config::ImageCpuReadback::Off;
+			} else if (Common::EqualNoCase(value, "small")) {
+				options.config.image_cpu_readback = Config::ImageCpuReadback::Small;
+			} else if (Common::EqualNoCase(value, "fault")) {
+				options.config.image_cpu_readback = Config::ImageCpuReadback::Fault;
+			} else if (Common::EqualNoCase(value, "fault+small")) {
+				options.config.image_cpu_readback = Config::ImageCpuReadback::FaultSmall;
+			} else {
+				::printf("invalid image CPU readback mode: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--image-readback-max") {
+			char*      end    = nullptr;
+			const auto parsed = std::strtoull(value.c_str(), &end, 0);
+			if (value.empty() || end == nullptr || *end != '\0') {
+				::printf("invalid image readback size: %s\n", value.c_str());
+				return false;
+			}
+			options.config.image_readback_max = parsed;
 		} else if (arg == "--sync-raw-image-buffers") {
 			if (!ParseBool(value, options.config.sync_raw_image_buffers)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

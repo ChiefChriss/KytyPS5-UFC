@@ -50,6 +50,8 @@ public:
 	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
 	               uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels = 0);
 	[[nodiscard]] Result GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
+	// Whether TileImage() supports writing `levels` (0: all) of the image's tiled guest layout.
+	[[nodiscard]] bool   CanTile(const ImageInfo& info, uint32_t levels = 0) const;
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
 	[[nodiscard]] Result TransformColor(Result input, ColorTransform transform, bool to_host);
@@ -110,6 +112,10 @@ private:
 	                                             uint64_t active, uint32_t remaining,
 	                                             uint64_t alignment, uint64_t max_range,
 	                                             uint32_t max_groups) noexcept;
+	// Fills `params`, or returns false for a layout the tiler does not support.
+	[[nodiscard]] bool   BuildTiling(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
+	                                 const ImageInfo& info, uint32_t levels, uint64_t source_base,
+	                                 uint64_t target_base, TilingParams& params) const;
 	[[nodiscard]] Tiling Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	                             const ImageInfo& info, uint32_t levels, uint64_t source_base,
 	                             uint64_t target_base);

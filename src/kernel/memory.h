@@ -147,6 +147,8 @@ bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
 // Not noexcept: under a Common::SoftExitScope its failure throws to the scope's owner.
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// Before the host reads guest memory in a system call (see RenderContext::PrepareHostRead()).
+void                   PrepareHostRead(const void* source, uint64_t size);
 // For a fault in a guest range briefly unmapped while the emulator replaced its mapping (MAP_FIXED
 // over a mapping, or a Windows file view split by a partial unmap): waits until it is mapped again
 // and returns the range's id. 0 for any other fault.

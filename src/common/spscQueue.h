@@ -13,6 +13,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -79,6 +80,33 @@ private:
 	uint32_t                              m_pauses     = 1;
 	uint32_t                              m_rounds     = 0;
 	uint64_t                              m_iterations = 0;
+};
+
+// Busy-waiting for threads that are not pinned to a core (game threads): an exponential
+// _mm_pause backoff, and once it has spun for a while (some tens of microseconds) a yield of the
+// processor between checks, so that a long wait does not hold a core another thread needs.
+class SpinBackoff {
+public:
+	void Spin() noexcept {
+		if (m_rounds < YieldAfterRounds) {
+			for (uint32_t i = 0; i < m_pauses; i++) {
+				SpinPause();
+			}
+			if (m_pauses < MaxPauses) {
+				m_pauses <<= 1u;
+			}
+			m_rounds++;
+			return;
+		}
+		std::this_thread::yield();
+	}
+
+private:
+	static constexpr uint32_t MaxPauses        = 64;
+	static constexpr uint32_t YieldAfterRounds = 64;
+
+	uint32_t m_pauses = 1;
+	uint32_t m_rounds = 0;
 };
 
 // A monotonically increasing counter one thread advances and one other thread waits on.

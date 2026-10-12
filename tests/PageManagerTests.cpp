@@ -1,6 +1,8 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 
+#include <algorithm>
+#include <atomic>
 #include <barrier>
 #include <cstdint>
 #include <cstdio>
@@ -8,6 +10,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -582,6 +585,226 @@ void TestConcurrentSharedWatchers() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestImageReadWatchers() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size * 8);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  Check(!manager.MayHaveImageReadWatch(address, page_size * 8),
+        "an untouched range reported image read watchers");
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  // Two images on overlapping pages: [page 1, page 3) and [page 2, page 5).
+  manager.UpdateImageReadWatchers<true>(address + page_size + 16,
+                                        page_size * 2 - 32);
+  Check(g_protection_calls == 1 && g_protection_ranges[0].size == page_size * 2,
+        "image read watch was not one protection call over its pages");
+  manager.UpdateImageReadWatchers<true>(address + page_size * 2 + 8,
+                                        page_size * 3 - 8);
+  Check(g_protection_calls == 2 && g_protection_ranges[1].address ==
+                                       address + page_size * 3 &&
+            g_protection_ranges[1].size == page_size * 2,
+        "a second image changed the protection of pages already protected");
+  Check(Protection(memory) == PAGE_READWRITE &&
+            Protection(memory + page_size) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 4) == PAGE_NOACCESS &&
+            Protection(memory + page_size * 5) == PAGE_READWRITE,
+        "image read watchers did not deny access to exactly their pages");
+  Check(manager.Watchers(address + page_size * 2).image_read == 2 &&
+            manager.Watchers(address + page_size).image_read == 1 &&
+            manager.Watchers(address).image_read == 0,
+        "image read watcher counts are wrong");
+  Check(manager.MayHaveImageReadWatch(address + page_size * 4, 1) &&
+            !manager.MayHaveImageReadWatch(address, page_size) &&
+            !manager.MayHaveImageReadWatch(address + page_size * 5, page_size * 3) &&
+            manager.IsWatched(address + page_size),
+        "lock-free image read watch query is wrong");
+
+  // A write watcher under an image: read-only once the image leaves.
+  manager.UpdatePageWatchers<true>(address + page_size * 2, page_size);
+  Check(Protection(memory + page_size * 2) == PAGE_NOACCESS,
+        "a write watcher weakened an image read watch");
+  manager.UpdateImageReadWatchers<false>(address + page_size + 16,
+                                         page_size * 2 - 32);
+  Check(Protection(memory + page_size) == PAGE_READWRITE &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS,
+        "releasing one image released the page of another");
+  manager.UpdateImageReadWatchers<false>(address + page_size * 2 + 8,
+                                         page_size * 3 - 8);
+  Check(Protection(memory + page_size * 2) == PAGE_READONLY &&
+            Protection(memory + page_size * 3) == PAGE_READWRITE &&
+            !manager.MayHaveImageReadWatch(address, page_size * 8),
+        "the last image did not restore the write-watched protection");
+  manager.UpdatePageWatchers<false>(address + page_size * 2, page_size);
+
+  // Buffer read watchers and image read watchers share pages.
+  const auto region_base = address & ~(TRACKER_REGION_SIZE - 1);
+  const auto page = static_cast<size_t>((address - region_base) / page_size) + 6;
+  RegionBits mask;
+  mask.Set(page);
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+  manager.UpdateImageReadWatchers<true>(address + page_size * 6, page_size);
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+  Check(Protection(memory + page_size * 6) == PAGE_NOACCESS &&
+            manager.Watchers(address + page_size * 6).buffer_read == 0,
+        "a buffer read unwatch released an image read watch");
+  manager.UpdateImageReadWatchers<false>(address + page_size * 6, page_size);
+  Check(IsWritable(memory + page_size * 6), "page did not become writable");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// Random operations of the three watcher kinds over pages around a region boundary, checked
+// against a model of the counts after every step.
+void TestRandomizedWatchers() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  constexpr size_t pages = 48;
+  auto *memory = Allocate(region_size * 2);
+  const auto allocation = reinterpret_cast<uint64_t>(memory);
+  const auto boundary = (allocation + region_size - 1) & ~(region_size - 1);
+  const auto base = boundary - page_size * (pages / 2);
+  Check(base >= allocation && base + pages * page_size <= allocation + region_size * 2,
+        "randomized test window does not fit the allocation");
+
+  struct Model {
+    uint32_t write = 0;
+    uint32_t buffer = 0;
+    uint32_t image = 0;
+  };
+  std::vector<Model> model(pages);
+  struct Owner {
+    int kind;
+    size_t first;
+    size_t count;
+  };
+  std::vector<Owner> owners;
+  std::mt19937_64 random(0x1234abcdull);
+  const auto expected = [&](size_t page) {
+    const auto &state = model[page];
+    if (state.buffer != 0 || state.image != 0) {
+      return static_cast<uint32_t>(PAGE_NOACCESS);
+    }
+    return static_cast<uint32_t>(state.write != 0 ? PAGE_READONLY : PAGE_READWRITE);
+  };
+  const auto apply = [&](const Owner &owner, bool track) {
+    const auto address = base + owner.first * page_size;
+    const auto size = owner.count * page_size;
+    for (size_t page = owner.first; page < owner.first + owner.count; page++) {
+      auto &state = model[page];
+      auto &count = owner.kind == 0 ? state.write : owner.kind == 1 ? state.buffer : state.image;
+      count = track ? count + 1 : count - 1;
+    }
+    if (owner.kind == 0) {
+      track ? manager.UpdatePageWatchers<true>(address, size)
+            : manager.UpdatePageWatchers<false>(address, size);
+    } else if (owner.kind == 2) {
+      // Images cover parts of their first and last pages.
+      const auto inset = size > 64 ? 16u : 0u;
+      track ? manager.UpdateImageReadWatchers<true>(address + inset, size - inset * 2)
+            : manager.UpdateImageReadWatchers<false>(address + inset, size - inset * 2);
+    } else {
+      // Buffer read watchers come per tracking region, one owner per page.
+      for (size_t page = owner.first; page < owner.first + owner.count;) {
+        const auto page_address = base + page * page_size;
+        const auto region_base = page_address & ~(region_size - 1);
+        RegionBits mask;
+        while (page < owner.first + owner.count &&
+               ((base + page * page_size) & ~(region_size - 1)) == region_base) {
+          mask.Set(static_cast<size_t>((base + page * page_size - region_base) / page_size));
+          page++;
+        }
+        track ? manager.UpdatePageWatchersForRegion<true, true>(region_base, mask)
+              : manager.UpdatePageWatchersForRegion<false, true>(region_base, mask);
+      }
+    }
+  };
+  for (uint32_t step = 0; step < 3000; step++) {
+    const bool release = !owners.empty() && (random() % 100 < 45 || owners.size() > 40);
+    if (release) {
+      const auto index = random() % owners.size();
+      apply(owners[index], false);
+      owners.erase(owners.begin() + static_cast<std::ptrdiff_t>(index));
+    } else {
+      Owner owner{static_cast<int>(random() % 3), random() % pages, 1 + random() % 6};
+      owner.count = std::min(owner.count, pages - owner.first);
+      if (owner.kind == 1) {
+        bool free = true;
+        for (size_t page = owner.first; page < owner.first + owner.count; page++) {
+          free = free && model[page].buffer == 0;
+        }
+        if (!free) {
+          owner.kind = 2;
+        }
+      }
+      apply(owner, true);
+      owners.push_back(owner);
+    }
+    for (size_t page = 0; page < pages; page++) {
+      const auto address = base + page * page_size;
+      const auto watchers = manager.Watchers(address);
+      Check(Protection(reinterpret_cast<void *>(address)) == expected(page),
+            "randomized watchers installed a wrong protection");
+      Check(watchers.write == model[page].write &&
+                watchers.buffer_read == model[page].buffer &&
+                watchers.image_read == model[page].image,
+            "randomized watcher counts diverged from the model");
+      Check(manager.MayHaveImageReadWatch(address, page_size) == (model[page].image != 0),
+            "lock-free image query diverged from the model");
+    }
+  }
+  for (const auto &owner : owners) {
+    apply(owner, false);
+  }
+  for (size_t page = 0; page < pages; page++) {
+    Check(IsWritable(reinterpret_cast<void *>(base + page * page_size)),
+          "randomized release did not restore access");
+  }
+  Check(!manager.MayHaveImageReadWatch(base, pages * page_size),
+        "released image watchers remained visible");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+void TestConcurrentImageWatchers() {
+  constexpr size_t worker_count = 8;
+  PageManager manager;
+  auto *memory = Allocate(TRACKER_PAGE_SIZE * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> reads{0};
+  // A reader polls the lock-free query while images come and go.
+  std::jthread reader([&] {
+    while (!stop.load()) {
+      (void)manager.MayHaveImageReadWatch(address, TRACKER_PAGE_SIZE * 2);
+      reads.fetch_add(1);
+    }
+  });
+  std::barrier phase(worker_count, [&]() noexcept {});
+  std::vector<std::jthread> workers;
+  for (size_t i = 0; i < worker_count; i++) {
+    workers.emplace_back([&, i] {
+      for (size_t round = 0; round < 200; round++) {
+        manager.UpdateImageReadWatchers<true>(address + i * 64, 64 + TRACKER_PAGE_SIZE);
+        phase.arrive_and_wait();
+        manager.UpdateImageReadWatchers<false>(address + i * 64, 64 + TRACKER_PAGE_SIZE);
+        phase.arrive_and_wait();
+      }
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  stop.store(true);
+  reader.join();
+  Check(IsWritable(memory) && IsWritable(memory + TRACKER_PAGE_SIZE) &&
+            !manager.MayHaveImageReadWatch(address, TRACKER_PAGE_SIZE * 2) &&
+            reads.load() != 0,
+        "concurrent image watchers left protection behind");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
   const auto page_size = manager.GetPageSize();
@@ -610,6 +833,24 @@ void TestConcurrentSharedWatchers() {
     mask.Set(page);
     manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
     manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+  } else if (std::strcmp(name, "image-overflow") == 0) {
+    auto *memory = Allocate(page_size);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    for (uint32_t count = 0; count < 256; count++) {
+      manager.UpdateImageReadWatchers<true>(address, page_size);
+    }
+  } else if (std::strcmp(name, "image-underflow") == 0) {
+    auto *memory = Allocate(page_size);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    manager.UpdateImageReadWatchers<true>(address, page_size);
+    manager.UpdateImageReadWatchers<false>(address, page_size);
+    manager.UpdateImageReadWatchers<false>(address, page_size);
+  } else if (std::strcmp(name, "destructor-image") == 0) {
+    auto doomed = std::make_unique<PageManager>();
+    auto *memory = Allocate(page_size);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    doomed->UpdateImageReadWatchers<true>(address, page_size);
+    doomed.reset();
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
@@ -676,7 +917,8 @@ void CheckDeathCase(const char *name) {
 void TestFatalPaths() {
   for (const char *name :
        {"invalid-range", "unknown-untrack", "destructor-watch",
-        "known-write-underflow", "read-overflow", "write-overflow"}) {
+        "known-write-underflow", "read-overflow", "write-overflow",
+        "image-overflow", "image-underflow", "destructor-image"}) {
     CheckDeathCase(name);
   }
 }
@@ -705,6 +947,9 @@ int main(int argc, char **argv) {
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();
+  TestImageReadWatchers();
+  TestRandomizedWatchers();
+  TestConcurrentImageWatchers();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

@@ -37,6 +37,11 @@ public:
 	// waits for it. Only for work that no queued operation depends on (memory the guest unmaps
 	// after the operations that used it executed).
 	void SendUrgentCommandSync(Common::UniqueFunction<void>&& command);
+	// As SendUrgentCommandSync() for a caller that spins until the command ran: posting it takes
+	// no lock and the caller waits without the kernel while the execution thread is busy (an idle
+	// one is woken through the command queue). The execution and command processor threads of a
+	// pipelined GPU, and an inline GPU, run it as SendCommandSync().
+	void SendUrgentCommandSpin(void (*function)(void* context), void* context);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> draw_commands,
@@ -156,6 +161,19 @@ private:
 	void                          ForgetExecutedWrites();
 	// Commands that run before the next operation the execution thread takes.
 	void                                      RunUrgentCommands();
+	// SendUrgentCommandSpin(): a lock-free stack of the commands of spinning callers, which live
+	// on their stacks until `done`.
+	struct SpinCommand {
+		void (*function)(void*) = nullptr;
+		void*                   context = nullptr;
+		SpinCommand*            next    = nullptr;
+		std::atomic<uint32_t>   done {0};
+	};
+	void                                      RunSpinCommands();
+	alignas(64) std::atomic<SpinCommand*>     m_spin_commands {nullptr};
+	// The execution thread waits for an operation (or stopped): a spin command needs one to run.
+	alignas(64) std::atomic_bool              m_executor_idle {false};
+	std::atomic_bool                          m_executor_stopped {false};
 	std::mutex                                m_urgent_mutex;
 	std::vector<Common::UniqueFunction<void>> m_urgent_commands;
 	std::atomic_uint32_t                      m_urgent_pending {0};

@@ -224,6 +224,67 @@ void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
 	done.acquire();
 }
 
+void GuestGpu::SendUrgentCommandSpin(void (*function)(void* context), void* context) {
+	EXIT_IF(function == nullptr);
+	if (!m_pipelined || IsGpuThread() || g_cp_thread) {
+		SendCommandSync([function, context] { function(context); });
+		return;
+	}
+	SpinCommand command;
+	command.function = function;
+	command.context  = context;
+	auto* head       = m_spin_commands.load(std::memory_order_relaxed);
+	do {
+		command.next = head;
+	} while (!m_spin_commands.compare_exchange_weak(head, &command, std::memory_order_seq_cst,
+	                                                std::memory_order_relaxed));
+	// The execution thread looks for spin commands before each operation, and before it waits for
+	// one after announcing that it does (seq_cst on both sides): an idle thread needs an operation.
+	if (m_executor_idle.load(std::memory_order_seq_cst)) {
+		SendCommand([this] { RunSpinCommands(); });
+	}
+	Common::SpinBackoff backoff;
+	while (command.done.load(std::memory_order_acquire) == 0) {
+		if (m_executor_stopped.load(std::memory_order_acquire)) {
+			// Shutdown: the execution thread drained the commands it saw before it stopped.
+			if (command.done.load(std::memory_order_acquire) == 0) {
+				RunSpinCommands();
+			}
+			continue;
+		}
+		backoff.Spin();
+	}
+}
+
+void GuestGpu::RunSpinCommands() {
+	auto* commands = m_spin_commands.exchange(nullptr, std::memory_order_acquire);
+	if (commands == nullptr) {
+		return;
+	}
+	if (IsGpuThread()) {
+		m_renderer.GetRenderExecutor().InvalidateRenderTargetMemo();
+		m_renderer.GetRenderExecutor().FlushDeferredDispatchBarrier();
+		if (auto* copies = m_renderer.GetCommandScheduler().HostCopies(); copies != nullptr) {
+			copies->Drain();
+		}
+	}
+	// Oldest first.
+	SpinCommand* ordered = nullptr;
+	while (commands != nullptr) {
+		auto* next     = commands->next;
+		commands->next = ordered;
+		ordered        = commands;
+		commands       = next;
+	}
+	while (ordered != nullptr) {
+		// The caller may return as soon as its command is done.
+		auto* next = ordered->next;
+		ordered->function(ordered->context);
+		ordered->done.store(1, std::memory_order_release);
+		ordered = next;
+	}
+}
+
 void GuestGpu::RunUrgentCommands() {
 	if (m_urgent_pending.load(std::memory_order_acquire) == 0) {
 		return;
@@ -383,11 +444,21 @@ void GuestGpu::ExecutionThread() {
 		if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
 			RunUrgentCommands();
 		}
+		if (m_spin_commands.load(std::memory_order_relaxed) != nullptr) {
+			RunSpinCommands();
+		}
 		auto operation = operations.TryPop();
 		if (!operation) {
 			m_executed.Notify();
 			unnotified = 0;
-			operation  = operations.Pop();
+			// See SendUrgentCommandSpin().
+			m_executor_idle.store(true, std::memory_order_seq_cst);
+			if (m_spin_commands.load(std::memory_order_seq_cst) != nullptr) {
+				m_executor_idle.store(false, std::memory_order_relaxed);
+				continue;
+			}
+			operation = operations.Pop();
+			m_executor_idle.store(false, std::memory_order_relaxed);
 			if (!operation) {
 				break;
 			}
@@ -403,6 +474,9 @@ void GuestGpu::ExecutionThread() {
 		}
 	}
 	m_executed.Notify();
+	RunSpinCommands();
+	m_executor_stopped.store(true, std::memory_order_seq_cst);
+	RunSpinCommands();
 	g_gpu_thread = false;
 }
 
