@@ -945,12 +945,17 @@ public:
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
+	// Only the PageManager calls this, with the SpinGuard of the page's region held for the whole
+	// call, so every change of one page's protection through here is serialized per region, and a
+	// change never crosses regions. The mapping table is only read, so this takes m_mutex shared
+	// and the many watcher updates of the GPU threads and of the game's write faults run in
+	// parallel. Protect() (the game's mprotect) still takes m_mutex exclusive and so excludes it.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
@@ -1547,7 +1552,7 @@ private:
 #endif
 	}
 
-	std::mutex                                 m_mutex;
+	std::shared_mutex                          m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
