@@ -57,6 +57,8 @@ static void PrintUsage() {
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
+	::printf("  --pad-haptic-rumble <true|false>    Rumble pads that are not DualSenses from game haptic\n"
+	         "                                      audio (default: false).\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -407,6 +409,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (!ParseUint32(value, options.config.controller_vibration_intensity) ||
 			    options.config.controller_vibration_intensity > 100) {
 				::printf("invalid controller vibration intensity: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--pad-haptic-rumble") {
+			if (!ParseBool(value, options.config.pad_haptic_rumble)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--present-mode") {

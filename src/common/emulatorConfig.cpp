@@ -64,6 +64,10 @@ uint32_t GetControllerVibrationIntensity() {
 	return g_config->controller_vibration_intensity;
 }
 
+bool PadHapticRumbleEnabled() {
+	return g_config->pad_haptic_rumble;
+}
+
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
