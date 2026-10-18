@@ -53,5 +53,51 @@ int main() {
 	      "non-storage view kept storage usage or lost attachment usage");
 	Check(ImageViewOps::ResolveViewUsage(backing_usage, true, rgba8_features) == backing_usage,
 	      "storage view lost backing usage");
+	{
+		// TileGetTextureSize memoizes results per thread. Repeated and interleaved queries must
+		// return the first computation, and the linear layout keeps caller-owned mip fields.
+		constexpr auto     format = Prospero::BufferFormat::k32Float;
+		constexpr uint32_t levels = 7;
+		TileSizeAlign      first_total {};
+		TileSizeOffset     first_mip[levels] {};
+		TilePaddedSize     first_padded[levels] {};
+		TileGetTextureSize(format, 65, 33, levels, Prospero::TileMode::kStandard256B, &first_total,
+		                   first_mip, first_padded);
+		Check(first_total.size == 0x4700 && first_total.align == 0x100,
+		      "reference small-block texture size changed");
+		for (uint32_t pass = 0; pass < 2; pass++) {
+			TileSizeAlign  linear_total {};
+			TileSizeOffset linear_mip[1] {};
+			TilePaddedSize linear_padded[1] {};
+			linear_mip[0].src_size = 0xabcd0000u + pass;
+			linear_mip[0].x        = 7;
+			TileGetTextureSize(format, 64, 64, 1, Prospero::TileMode::kLinear, &linear_total,
+			                   linear_mip, linear_padded);
+			Check(linear_total.size != 0 && linear_mip[0].size != 0 && linear_padded[0].width != 0,
+			      "linear texture size missing");
+			Check(linear_mip[0].src_size == 0xabcd0000u + pass && linear_mip[0].x == 7,
+			      "linear texture size overwrote caller-owned mip fields");
+			TileSizeAlign  total {};
+			TileSizeOffset mip[levels] {};
+			TilePaddedSize padded[levels] {};
+			TileGetTextureSize(format, 65, 33, levels, Prospero::TileMode::kStandard256B, &total,
+			                   mip, padded);
+			bool same = total.size == first_total.size && total.align == first_total.align;
+			for (uint32_t level = 0; level < levels; level++) {
+				same &= mip[level].size == first_mip[level].size &&
+				        mip[level].offset == first_mip[level].offset &&
+				        mip[level].src_size == first_mip[level].src_size &&
+				        mip[level].src_offset == first_mip[level].src_offset &&
+				        padded[level].width == first_padded[level].width &&
+				        padded[level].height == first_padded[level].height;
+			}
+			Check(same, "memoized texture size changed between queries");
+		}
+		TileSizeAlign total_only {};
+		TileGetTextureSize(format, 65, 33, levels, Prospero::TileMode::kStandard256B, &total_only,
+		                   nullptr, nullptr);
+		Check(total_only.size == first_total.size && total_only.align == first_total.align,
+		      "total-only texture size query disagreed with the full query");
+	}
 	std::puts("TextureMipTrimTests: all cases passed");
 }

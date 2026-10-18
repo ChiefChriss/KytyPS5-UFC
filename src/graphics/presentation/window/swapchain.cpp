@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -17,10 +18,19 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
+
+// stb_image_write is compiled TU-locally inside libPngEnc.cpp (STB_IMAGE_WRITE_STATIC), so the
+// opt-in frame dump carries its own writer here. The two definitions are independent.
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -145,6 +155,319 @@ private:
 	std::vector<Presenter::Frame*>                 m_free;
 	vk::Format                                     m_format = vk::Format::eUndefined;
 };
+
+namespace {
+
+// Opt-in presented-frame dump for unattended visual verification (the overnight desktop is
+// often not composited, so screen capture returns black). The readback copy is recorded into
+// the existing present command buffer, but completion is only *polled* later from the present
+// thread via the scheduler timeline; there is deliberately no in-present wait (the earlier
+// in-present readback stalled the command scheduler and hung the GPU).
+struct FrameDumpSettings {
+	std::string dir;
+	uint64_t    interval_ns = 2'000'000'000ull;
+	uint64_t    start_ns    = 1'000'000'000ull;
+	uint32_t    max_width   = 960;
+	bool        enabled     = false;
+};
+
+const FrameDumpSettings& GetFrameDumpSettings() {
+	static const FrameDumpSettings settings = [] {
+		FrameDumpSettings value {};
+		const char*       dir = std::getenv("KYTY_UFC_FRAME_DUMP");
+		if (dir == nullptr || dir[0] == '\0') {
+			return value;
+		}
+		value.enabled = true;
+		value.dir     = dir;
+		const auto read_u32 = [](const char* name, uint32_t fallback) {
+			const char* text = std::getenv(name);
+			return text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10))
+			                       : fallback;
+		};
+		value.interval_ns =
+		    static_cast<uint64_t>(read_u32("KYTY_UFC_FRAME_DUMP_INTERVAL_MS", 2000)) * 1'000'000ull;
+		value.start_ns =
+		    static_cast<uint64_t>(read_u32("KYTY_UFC_FRAME_DUMP_START_MS", 1000)) * 1'000'000ull;
+		value.max_width = std::max<uint32_t>(read_u32("KYTY_UFC_FRAME_DUMP_MAX_WIDTH", 960), 16u);
+		if (value.interval_ns == 0) {
+			value.interval_ns = 2'000'000'000ull;
+		}
+		std::error_code error;
+		std::filesystem::create_directories(value.dir, error);
+		return value;
+	}();
+	return settings;
+}
+
+uint32_t FrameDumpBytesPerPixel(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eA2B10G10R10UnormPack32: return 4;
+		default: return 0;
+	}
+}
+
+enum class FrameDumpPixelFormat { Unsupported, Rgba8, Bgra8, A2R10G10B10, A2B10G10R10 };
+
+FrameDumpPixelFormat ClassifyFrameDumpFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb: return FrameDumpPixelFormat::Rgba8;
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb: return FrameDumpPixelFormat::Bgra8;
+		case vk::Format::eA2R10G10B10UnormPack32: return FrameDumpPixelFormat::A2R10G10B10;
+		case vk::Format::eA2B10G10R10UnormPack32: return FrameDumpPixelFormat::A2B10G10R10;
+		default: return FrameDumpPixelFormat::Unsupported;
+	}
+}
+
+uint64_t FrameDumpNowNs() {
+	return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+}
+
+class FrameDumper {
+public:
+	bool Enabled() const { return GetFrameDumpSettings().enabled; }
+
+	bool Due() const {
+		if (!GetFrameDumpSettings().enabled || m_pending) {
+			return false;
+		}
+		return FrameDumpNowNs() >= m_next_due_ns;
+	}
+
+	// Records the readback and the host-read barrier into the caller's command buffer. The
+	// source image must already be in eTransferSrcOptimal with eTransferRead access.
+	bool Record(vk::CommandBuffer command, const VulkanImage& source,
+	            const GraphicContext& graphics) {
+		const uint32_t bytes_per_pixel = FrameDumpBytesPerPixel(source.format);
+		const auto     pixel_format    = ClassifyFrameDumpFormat(source.format);
+		if (bytes_per_pixel == 0 || pixel_format == FrameDumpPixelFormat::Unsupported ||
+		    source.extent.width == 0 || source.extent.height == 0) {
+			if (!m_unsupported_logged) {
+				m_unsupported_logged = true;
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Frame dump: unsupported presented format {}; disabled for this run\n",
+				    static_cast<int>(source.format)));
+			}
+			m_next_due_ns = FrameDumpNowNs() + GetFrameDumpSettings().interval_ns;
+			return false;
+		}
+		const uint64_t size = static_cast<uint64_t>(source.extent.width) *
+		                      source.extent.height * bytes_per_pixel;
+		vk::BufferCreateInfo buffer_info {};
+		buffer_info.size  = size;
+		buffer_info.usage = vk::BufferUsageFlagBits::eTransferDst;
+		if (graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer) != vk::Result::eSuccess) {
+			m_buffer      = nullptr;
+			m_next_due_ns = FrameDumpNowNs() + GetFrameDumpSettings().interval_ns;
+			return false;
+		}
+		const auto requirements = graphics.device.getBufferMemoryRequirements(m_buffer);
+		const auto wanted = vk::MemoryPropertyFlagBits::eHostVisible |
+		                    vk::MemoryPropertyFlagBits::eHostCoherent;
+		const auto& memory = graphics.GetPhysicalDeviceMemoryProperties();
+		bool        bound  = false;
+		for (uint32_t type = 0; type < memory.memoryTypeCount; type++) {
+			const auto flags = memory.memoryTypes[type].propertyFlags;
+			if ((requirements.memoryTypeBits & (1u << type)) == 0 || (flags & wanted) != wanted) {
+				continue;
+			}
+			vk::MemoryAllocateInfo allocate {};
+			allocate.allocationSize  = requirements.size;
+			allocate.memoryTypeIndex = type;
+			if (graphics.device.allocateMemory(&allocate, nullptr, &m_memory) ==
+			        vk::Result::eSuccess &&
+			    graphics.device.bindBufferMemory(m_buffer, m_memory, 0) == vk::Result::eSuccess) {
+				bound = true;
+				break;
+			}
+			if (m_memory != nullptr) {
+				graphics.device.freeMemory(m_memory, nullptr);
+				m_memory = nullptr;
+			}
+		}
+		if (bound &&
+		    graphics.device.mapMemory(m_memory, 0, VK_WHOLE_SIZE, {}, &m_mapped) ==
+		        vk::Result::eSuccess) {
+			// fall through
+		} else {
+			bound = false;
+		}
+		if (!bound) {
+			if (m_buffer != nullptr) {
+				graphics.device.destroyBuffer(m_buffer, nullptr);
+				m_buffer = nullptr;
+			}
+			if (m_memory != nullptr) {
+				graphics.device.freeMemory(m_memory, nullptr);
+				m_memory = nullptr;
+			}
+			m_next_due_ns = FrameDumpNowNs() + GetFrameDumpSettings().interval_ns;
+			return false;
+		}
+
+		vk::BufferImageCopy region {};
+		region.bufferOffset                    = 0;
+		region.bufferRowLength                 = 0;
+		region.bufferImageHeight               = 0;
+		region.imageSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
+		region.imageSubresource.mipLevel       = 0;
+		region.imageSubresource.baseArrayLayer = 0;
+		region.imageSubresource.layerCount     = 1;
+		region.imageOffset                     = vk::Offset3D {0, 0, 0};
+		region.imageExtent = vk::Extent3D {source.extent.width, source.extent.height, 1};
+		command.copyImageToBuffer(source.image, vk::ImageLayout::eTransferSrcOptimal, m_buffer, 1,
+		                          &region);
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = m_buffer;
+		barrier.offset              = 0;
+		barrier.size                = size;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eHost, vk::DependencyFlags {}, 0,
+		                        nullptr, 1, &barrier, 0, nullptr);
+
+		m_width  = source.extent.width;
+		m_height = source.extent.height;
+		m_pixel_format = pixel_format;
+		return true;
+	}
+
+	// Called after the present command buffer that carried the copy has been submitted.
+	void Commit(uint64_t tick) {
+		m_pending      = true;
+		m_pending_tick = tick;
+	}
+
+	void Poll(CommandScheduler& scheduler, const GraphicContext& graphics) {
+		if (!m_pending) {
+			return;
+		}
+		if (!scheduler.IsFree(m_pending_tick)) {
+			return;
+		}
+		if (m_mapped != nullptr) {
+			WritePng();
+		}
+		graphics.device.unmapMemory(m_memory);
+		graphics.device.destroyBuffer(m_buffer, nullptr);
+		graphics.device.freeMemory(m_memory, nullptr);
+		m_buffer              = nullptr;
+		m_memory              = nullptr;
+		m_mapped              = nullptr;
+		m_pending             = false;
+		m_next_due_ns         = FrameDumpNowNs() + GetFrameDumpSettings().interval_ns;
+	}
+
+	// Releases the readback resources during normal teardown. An in-flight copy is left for
+	// device destruction, because waiting on it here could deadlock the shutdown path.
+	void Abandon(const GraphicContext& graphics) {
+		if (m_pending) {
+			return;
+		}
+		if (m_mapped != nullptr) {
+			graphics.device.unmapMemory(m_memory);
+			m_mapped = nullptr;
+		}
+		if (m_buffer != nullptr) {
+			graphics.device.destroyBuffer(m_buffer, nullptr);
+			m_buffer = nullptr;
+		}
+		if (m_memory != nullptr) {
+			graphics.device.freeMemory(m_memory, nullptr);
+			m_memory = nullptr;
+		}
+	}
+
+private:
+	void WritePng() {
+		const auto& settings = GetFrameDumpSettings();
+		const int   width    = static_cast<int>(m_width);
+		const int   height   = static_cast<int>(m_height);
+		int         factor   = 1;
+		if (width > static_cast<int>(settings.max_width)) {
+			factor = (width + static_cast<int>(settings.max_width) - 1) /
+			         static_cast<int>(settings.max_width);
+		}
+		const int out_width  = std::max(width / factor, 1);
+		const int out_height = std::max(height / factor, 1);
+		std::vector<uint8_t> pixels(static_cast<size_t>(out_width) * out_height * 4);
+		const auto*          source = static_cast<const uint8_t*>(m_mapped);
+		for (int y = 0; y < out_height; y++) {
+			const auto* row = source + static_cast<size_t>(y * factor) * width * 4;
+			for (int x = 0; x < out_width; x++) {
+				const auto* in = row + static_cast<size_t>(x * factor) * 4;
+				auto*       out = pixels.data() + (static_cast<size_t>(y) * out_width + x) * 4;
+				switch (m_pixel_format) {
+					case FrameDumpPixelFormat::Rgba8:
+						out[0] = in[0];
+						out[1] = in[1];
+						out[2] = in[2];
+						out[3] = in[3];
+						break;
+					case FrameDumpPixelFormat::Bgra8:
+						out[0] = in[2];
+						out[1] = in[1];
+						out[2] = in[0];
+						out[3] = in[3];
+						break;
+					case FrameDumpPixelFormat::A2R10G10B10: {
+						const uint32_t packed = *reinterpret_cast<const uint32_t*>(in);
+						out[0]                = static_cast<uint8_t>(((packed >> 20u) & 0x3ffu) >> 2u);
+						out[1]                = static_cast<uint8_t>(((packed >> 10u) & 0x3ffu) >> 2u);
+						out[2]                = static_cast<uint8_t>((packed & 0x3ffu) >> 2u);
+						out[3] = static_cast<uint8_t>(((packed >> 30u) & 0x3u) * 85u);
+						break;
+					}
+					case FrameDumpPixelFormat::A2B10G10R10: {
+						const uint32_t packed = *reinterpret_cast<const uint32_t*>(in);
+						out[0]                = static_cast<uint8_t>((packed & 0x3ffu) >> 2u);
+						out[1]                = static_cast<uint8_t>(((packed >> 10u) & 0x3ffu) >> 2u);
+						out[2]                = static_cast<uint8_t>(((packed >> 20u) & 0x3ffu) >> 2u);
+						out[3] = static_cast<uint8_t>(((packed >> 30u) & 0x3u) * 85u);
+						break;
+					}
+					default:
+						out[0] = in[0];
+						out[1] = in[1];
+						out[2] = in[2];
+						out[3] = in[3];
+						break;
+				}
+			}
+		}
+		const auto path = fmt::format("{}/frame_{:06}.png", settings.dir, m_sequence++);
+		if (stbi_write_png(path.c_str(), out_width, out_height, 4, pixels.data(),
+		                   out_width * 4) != 0) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Frame dump: {} {}x{} (source {}x{})\n", path, out_width, out_height, width,
+			    height));
+		}
+	}
+
+	vk::Buffer       m_buffer         = nullptr;
+	vk::DeviceMemory m_memory         = nullptr;
+	void*            m_mapped         = nullptr;
+	uint32_t         m_width          = 0;
+	uint32_t         m_height         = 0;
+	FrameDumpPixelFormat m_pixel_format = FrameDumpPixelFormat::Unsupported;
+	uint64_t         m_pending_tick   = 0;
+	uint64_t         m_next_due_ns    = FrameDumpNowNs() + GetFrameDumpSettings().start_ns;
+	uint64_t         m_sequence       = 0;
+	bool             m_pending        = false;
+	bool             m_unsupported_logged = false;
+};
+
+} // namespace
 
 void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format) {
 	if (extent.width == 0 || extent.height == 0 || format == vk::Format::eUndefined) {
@@ -306,6 +629,7 @@ struct Presenter::Impl {
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
 	}
+	~Impl() { dumper.Abandon(window.graphic_ctx); }
 
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
@@ -344,6 +668,7 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	FrameDumper           dumper;
 };
 
 void Swapchain::Create() {
@@ -966,6 +1291,12 @@ void Presenter::ClearLayer(int bus) {
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
 
+	// Drain a previous dump before recording a new one. This only polls the scheduler timeline;
+	// it never waits inside the present path.
+	if (dumper.Enabled()) {
+		dumper.Poll(present_scheduler, window.graphic_ctx);
+	}
+
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (swapchain.NeedsResize()) {
@@ -984,7 +1315,13 @@ void Presenter::Impl::Present() {
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
+			const bool dump_scheduled =
+			    layers[0].frame != nullptr && dumper.Due() &&
+			    dumper.Record(command.Handle(), layers[0].frame->image, window.graphic_ctx);
 			const auto tick = swapchain.Submit(present_scheduler);
+			if (dump_scheduled) {
+				dumper.Commit(tick);
+			}
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {
 					layer.frame->present_tick = tick;

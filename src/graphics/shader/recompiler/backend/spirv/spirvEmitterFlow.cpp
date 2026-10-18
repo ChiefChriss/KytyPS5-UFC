@@ -100,7 +100,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 }
 
 uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& flags,
-                               uint32_t exec) {
+                               IR::Value exec) {
 	auto&      state      = ctx.state;
 	const auto lane       = EmitSubgroupLocalInvocationId(state);
 	const auto bank_shift = state.builder.AllocateId();
@@ -142,9 +142,19 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), bounded, writable,
 		                          target.valid);
 		writable = bounded;
+		if (!flags.fetch_inactive && !flags.dpp8) {
+			// DPP16 BC=0/FI=0 suppresses the destination write when its source
+			// is EXEC-inactive; using the zero-fetched operand is not equivalent.
+			// DPP8 still writes that zero, and FI/BC retain their override behavior.
+			const auto source_active = EmitBallotLaneActiveBool(state, ctx.Ballot(exec), target.lane);
+			const auto source_ok     = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), source_ok, writable,
+			                          source_active);
+			writable = source_ok;
+		}
 	}
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, exec, writable);
+	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, ctx.Def(exec), writable);
 	return result;
 }
 
@@ -380,16 +390,14 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 	}
 }
 
-uint32_t ConvertClipCoordinate(EmitterState& state, uint32_t coordinate, float scale, float offset,
-                               float half_extent) {
+uint32_t ConvertClipCoordinate(EmitterState& state, uint32_t coordinate, uint32_t scale,
+                               uint32_t offset, float half_extent) {
 	const auto window  = state.builder.AllocateId();
 	const auto biased  = state.builder.AllocateId();
 	const auto divided = state.builder.AllocateId();
 	const auto ndc     = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpFMul, TypeF32(state), window, coordinate,
-	                          ConstantF32Value(state, scale));
-	state.builder.AddFunction(spv::OpFAdd, TypeF32(state), biased, window,
-	                          ConstantF32Value(state, offset));
+	state.builder.AddFunction(spv::OpFMul, TypeF32(state), window, coordinate, scale);
+	state.builder.AddFunction(spv::OpFAdd, TypeF32(state), biased, window, offset);
 	state.builder.AddFunction(spv::OpFDiv, TypeF32(state), divided, biased,
 	                          ConstantF32Value(state, half_extent));
 	state.builder.AddFunction(spv::OpFSub, TypeF32(state), ndc, divided,
@@ -399,16 +407,31 @@ uint32_t ConvertClipCoordinate(EmitterState& state, uint32_t coordinate, float s
 
 uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 	const auto& transform = state.input_info.vertex->clip_space;
-	uint32_t    components[4] {};
+	const auto  parameter = [&](uint32_t index, float value) {
+        if (!transform.dynamic) return ConstantF32Value(state, value);
+        const auto pointer = state.builder.AllocateId();
+        const auto bits    = state.builder.AllocateId();
+        const auto result  = state.builder.AllocateId();
+        state.builder.AddFunction(
+            spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
+            state.push_constant_variable, ConstantU32(state, 0),
+            ConstantU32(state, IR::PushData::ClipTransformStart(state.program.stage) + index));
+        state.builder.AddFunction(spv::OpLoad, TypeU32(state), bits, pointer);
+        state.builder.AddFunction(spv::OpBitcast, TypeF32(state), result, bits);
+        return result;
+	};
+	uint32_t components[4] {};
 	for (uint32_t i = 0; i < 4; i++) {
 		components[i] = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), components[i], position,
 		                          i);
 	}
-	components[0]        = ConvertClipCoordinate(state, components[0], transform.scale[0],
-	                                             transform.offset[0], transform.half_extent[0]);
-	components[1]        = ConvertClipCoordinate(state, components[1], transform.scale[1],
-	                                             transform.offset[1], transform.half_extent[1]);
+	components[0] =
+	    ConvertClipCoordinate(state, components[0], parameter(0, transform.scale[0]),
+	                          parameter(2, transform.offset[0]), transform.half_extent[0]);
+	components[1] =
+	    ConvertClipCoordinate(state, components[1], parameter(1, transform.scale[1]),
+	                          parameter(3, transform.offset[1]), transform.half_extent[1]);
 	const auto converted = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), converted,
 	                          components[0], components[1], components[2], components[3]);
@@ -522,6 +545,14 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (exp.kind == IR::ExportTargetKind::Position &&
 		    state.input_info.vertex->clip_space.enabled) {
 			value = ConvertPositionToClipSpace(state, value);
+		}
+		if (!uint_output && (exp.kind == IR::ExportTargetKind::Mrt ||
+		                     exp.kind == IR::ExportTargetKind::Position)) {
+			EmitNanTraceCheck(state,
+			                  value, exp.kind == IR::ExportTargetKind::Mrt
+			                             ? NanTrace::Site::ColorExport
+			                             : NanTrace::Site::PositionExport,
+			                  exp.index);
 		}
 		if (state.program.stage == ShaderType::Mesh) {
 			const auto kind = exp.kind == IR::ExportTargetKind::Position
@@ -647,7 +678,7 @@ uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto flags = inst.Flags<IR::DppMoveFlags>();
-	const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	const auto write = EmitDppWriteCondition(ctx, flags, inst.Arg(2));
 	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
 	                                                ctx.Arg(inst, 1));
 }
@@ -706,8 +737,21 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state  = ctx.state;
 	const auto ballot = ctx.Ballot(inst.Arg(1));
-	const auto lane   = ctx.FirstLane(ballot);
+	const auto low    = state.builder.AllocateId();
+	const auto high   = state.builder.AllocateId();
+	const auto bits   = state.builder.AllocateId();
+	const auto any    = state.builder.AllocateId();
+	const auto lane   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), bits, low, high);
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), any, bits, ConstantU32(state, 0));
+	// RDNA2 reads lane 0 with EXEC=0. An empty-ballot FindLSB result is undefined;
+	// never use it as the shuffle selector. Include both emulated wave64 halves.
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), lane, any, ctx.FirstLane(ballot),
+	                          ConstantU32(state, 0));
 	return ctx.Shuffle(inst, 0, lane);
 }
 

@@ -6,24 +6,30 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/dccClearEvaluator.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/vramBudget.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
+#include <string>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -32,6 +38,25 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+// Opt-in (KYTY_UFC_META_CLEAR_MEMO=1): avoid the m_lock + map lookup on repeated IsMetaCleared
+// calls for the same depth slice while no surface metadata changed.
+[[nodiscard]] bool MetaClearMemoEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UFC_META_CLEAR_MEMO");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// Debug (KYTY_UFC_META_CLEAR_MEMO_VERIFY=1): on a memo hit also take the lock and compare.
+[[nodiscard]] bool MetaClearMemoVerify() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UFC_META_CLEAR_MEMO_VERIFY");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -160,6 +185,22 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+	}
+	if (VramBudget::GcEnabled()) {
+		Log::WriteToConsoleAndLog(
+		    m_graphics.CanReportMemoryUsage()
+		        ? "VRAM GC: budget mode ON (KYTY_UFC_VRAM_GC_BUDGET=1), image age " +
+		              std::to_string(VramBudget::AgeFrames()) + " frames\n"
+		        : std::string("VRAM GC: budget mode requested but VK_EXT_memory_budget is not "
+		                      "available; stock collectors\n"));
+	}
+	// Opt-in (KYTY_UFC_GPU_DCC=1): user bisection tied UFC fighter-mesh corruption and device
+	// loss to this path or the compute fill conversion; the CPU readback path is the default.
+	const char* gpu_dcc = std::getenv("KYTY_UFC_GPU_DCC");
+	// Dev 094 all-on bisect: on by default, =0 turns it off
+	if (m_graphics.conditional_rendering_enabled &&
+	    (gpu_dcc == nullptr || std::strcmp(gpu_dcc, "0") != 0)) {
+		m_dcc_evaluator = std::make_unique<DccClearEvaluator>(graphics, scheduler);
 	}
 }
 
@@ -299,6 +340,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		    metadata->second.type == MetaDataInfo::Type::HTile) {
 			// A later binding may have reused this address for another metadata type.
 			m_surface_metas.erase(metadata);
+			NoteSurfaceMetaChange();
 		}
 	}
 	UnregisterImage(id);
@@ -499,6 +541,7 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.samples         = 1;
 	info.tile_mode       = Prospero::TileMode::kLinear;
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
+	WaitStats::NoteImageCreate(0);
 	const auto id        = InsertImage(info);
 	m_null_images.emplace(format, id);
 	return id;
@@ -737,6 +780,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.resources = std::max(requested.resources, cached.info.resources);
 	}
 	info.htile_clear_mask     = 0;
+	WaitStats::NoteImageCreate(4);
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
@@ -883,6 +927,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	RefreshCopySource(source_id);
+	WaitStats::NoteImageCreate(3);
 	const auto expanded_id = InsertImage(info);
 	auto&      source      = m_slot_images[source_id];
 	if (source.binding.is_bound || source.binding.is_target) {
@@ -1127,8 +1172,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
+		NoteSurfaceMetaChange();
 		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
+		}
+		if (range.Valid()) {
+			m_color_metadata_ranges.Add(range.address, range.size);
 		}
 	}
 	const auto layers = desc.info.TransferLayers();
@@ -1148,10 +1197,22 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
-		m_buffer_cache.ReadMemory(range.address, range.size, false);
+	bool       metadata_read_back = false;
+	bool       metadata_cleared   = false;
+	uint32_t   metadata_writer    = 0;
+	const auto slice_size         = range.size / layers;
+	// Only the selected slices are decoded, so only their bytes must be current.
+	const auto selected_address = range.address + slice_size * first;
+	const auto selected_size    = slice_size * count;
+	if (m_buffer_cache.IsRegionGpuModified(selected_address, selected_size)) {
+		if (MaterializeColorClearOnGpu(id, desc, first, image_first, count, slice_size)) {
+			return;
+		}
+		KYTY_PROFILER_BLOCK("TextureCache::ColorMetadataReadback", profiler::colors::RedA100);
+		metadata_writer    = m_buffer_cache.TakeMetadataWriter(range.address, range.size);
+		metadata_read_back = true;
+		m_buffer_cache.ReadMemory(selected_address, selected_size, false, WaitSite::ColorMetadata);
 	}
-	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
@@ -1175,6 +1236,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
 			            image_first + slice, 1}, clear);
 		}
+		metadata_cleared = true;
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
@@ -1183,6 +1245,105 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
+	if (metadata_read_back) {
+		WaitStats::NoteMetadataReadback(metadata_writer, metadata_cleared);
+	}
+}
+
+bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,
+                                              uint32_t image_first, uint32_t count,
+                                              uint64_t slice_size) {
+	const auto& view = desc.view_info;
+	if (m_dcc_evaluator == nullptr || desc.type != BindingType::RenderTarget ||
+	    desc.info.IsVolume() || desc.info.samples != 1 || view.level_count != 1 || count == 0) {
+		return false;
+	}
+	// Every byte value that decodes to a clear for this target is a candidate. Other values
+	// leave the target and its metadata untouched, exactly like the CPU path.
+	DccClearEvaluator::Request request {};
+	std::array<vk::ClearValue, DccClearEvaluator::MaxCandidates> colors {};
+	for (const uint8_t code: {uint8_t {0x00}, uint8_t {0x20}, uint8_t {0x40}, uint8_t {0x80},
+	                          uint8_t {0xc0}}) {
+		vk::ClearColorValue color {};
+		if (DecodeColorClear(desc, code, color)) {
+			request.codes[request.candidate_count] = code;
+			colors[request.candidate_count].color  = color;
+			request.candidate_count++;
+		}
+	}
+	if (request.candidate_count == 0) {
+		return true;
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		const auto&      image = m_slot_images[id];
+		if (image.info.IsDepth() || image.depth_id || image.info.samples != 1) {
+			return false;
+		}
+	}
+	// The check may expand the slices to 0xff, so they are a GPU write of the metadata. This
+	// publishes no guest bytes and does not invalidate images that alias the metadata range.
+	const auto metadata_address    = desc.info.metadata.range.address + slice_size * first;
+	const auto [metadata, offset]  = m_buffer_cache.ObtainBuffer(metadata_address,
+	                                                              slice_size * count, true, false);
+	request.metadata        = metadata->Handle();
+	request.metadata_offset = offset;
+	request.slice_size      = slice_size;
+	request.slices          = count;
+	auto& command           = m_scheduler.Current();
+	command.EndRendering();
+	const auto native     = command.Recorder();
+	const auto predicates = m_dcc_evaluator->Record(native, request);
+	if (predicates == DccClearEvaluator::NoPredicates) {
+		return false;
+	}
+
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	TrackImage(id);
+	// The clear is conditional, so the target must already hold its guest contents.
+	if (image.IsBufferModified() || image.IsCpuDirty()) {
+		InitializeImage(id);
+	}
+	image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	              vk::AccessFlagBits2::eColorAttachmentWrite, {}, native);
+	const vk::Extent2D extent {std::max(image.info.extent.width >> view.base_level, 1u),
+	                           std::max(image.info.extent.height >> view.base_level, 1u)};
+	for (uint32_t slice = 0; slice < count; slice++) {
+		ImageViewInfo slice_view {};
+		slice_view.format      = view.format;
+		slice_view.type        = vk::ImageViewType::e2D;
+		slice_view.base_level  = view.base_level;
+		slice_view.base_layer  = image_first + slice;
+		slice_view.layer_count = 1;
+		slice_view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+		vk::RenderingAttachmentInfo attachment {};
+		attachment.imageView   = image.FindView(slice_view);
+		attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+		attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+		vk::RenderingInfo rendering {};
+		rendering.renderArea.extent    = extent;
+		rendering.layerCount           = 1;
+		rendering.colorAttachmentCount = 1;
+		rendering.pColorAttachments    = &attachment;
+		native.beginRendering(&rendering);
+		for (uint32_t k = 0; k < request.candidate_count; k++) {
+			vk::ConditionalRenderingBeginInfoEXT condition {};
+			condition.buffer = m_dcc_evaluator->PredicateBuffer();
+			condition.offset = predicates + uint64_t {slice} * DccClearEvaluator::PredicateStride +
+			                   uint64_t {k} * sizeof(uint32_t);
+			native.beginConditionalRenderingEXT(&condition);
+			const vk::ClearAttachment clear {vk::ImageAspectFlagBits::eColor, 0, colors[k]};
+			const vk::ClearRect       rect {vk::Rect2D {{0, 0}, extent}, 0, 1};
+			native.clearAttachments(1, &clear, 1, &rect);
+			native.endConditionalRenderingEXT();
+		}
+		native.endRendering();
+	}
+	CommitGpuWrite(image);
+	WaitStats::NoteMetadataGpuEvaluation(count);
+	return true;
 }
 
 void TextureCache::RefreshImage(ImageId id) {
@@ -1235,6 +1396,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		ImageInfo info {};
 		info.data   = stencil;
 		info.extent = depth.info.extent;
+		WaitStats::NoteImageCreate(1);
 		association = InsertImage(info);
 	}
 	auto& record = m_slot_images[association];
@@ -1294,6 +1456,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
+			WaitStats::NoteImageCreate(2);
 			result         = InsertImage(desc.info);
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
@@ -1448,9 +1611,13 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		m_surface_metas.emplace(desc.info.metadata.range.address,
-		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                      .clear_mask = image.info.htile_clear_mask});
+		if (m_surface_metas
+		        .emplace(desc.info.metadata.range.address,
+		                 MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
+		                               .clear_mask = image.info.htile_clear_mask})
+		        .second) {
+			NoteSurfaceMetaChange();
+		}
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1594,7 +1761,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		view.layer_count = range.layerCount;
 		view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
 		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
-		              vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
+		              vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Recorder());
 		vk::RenderingAttachmentInfo attachment {};
 		attachment.imageView   = image.FindView(view);
 		attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
@@ -1608,23 +1775,23 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		rendering.layerCount           = range.layerCount;
 		rendering.colorAttachmentCount = 1;
 		rendering.pColorAttachments    = &attachment;
-		command.Handle().beginRendering(&rendering);
-		command.Handle().endRendering();
+		command.Recorder().beginRendering(&rendering);
+		command.Recorder().endRendering();
 		CommitGpuWrite(image);
 		return;
 	}
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
-	              command.Handle());
+	              command.Recorder());
 	auto native_range = range;
 	if (image.info.IsVolume()) {
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
 	}
 	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
-		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		command.Recorder().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
 		                                 &clear.color, 1, &native_range);
 	} else {
-		command.Handle().clearDepthStencilImage(image.backing.image,
+		command.Recorder().clearDepthStencilImage(image.backing.image,
 		                                        vk::ImageLayout::eTransferDstOptimal,
 		                                        &clear.depthStencil, 1, &native_range);
 	}
@@ -1829,7 +1996,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
-	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
@@ -1904,13 +2071,51 @@ bool TextureCache::IsMeta(uint64_t address) {
 	return found != m_surface_metas.end();
 }
 
-bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
+bool TextureCache::OverlapsColorMetadata(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
-		return false;
+	return m_color_metadata_ranges.Intersects(address, size);
+}
+
+void TextureCache::NoteSurfaceMetaChange() {
+	m_surface_meta_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
+	const bool memo_enabled = MetaClearMemoEnabled() && GuestGpu::IsGpuThread();
+	uint64_t   generation   = 0;
+	if (memo_enabled) {
+		// Read the generation before the lookup: a change that lands after this read leaves a
+		// newer generation, so the stored answer is rejected on the next call.
+		generation = m_surface_meta_generation.load(std::memory_order_acquire);
+		if (m_meta_clear_memo.generation == generation && m_meta_clear_memo.address == address &&
+		    m_meta_clear_memo.slice == slice) {
+			if (!MetaClearMemoVerify()) {
+				return m_meta_clear_memo.result;
+			}
+			std::scoped_lock lock {m_lock};
+			const auto       found = m_surface_metas.find(address);
+			const bool       locked = !(found == m_surface_metas.end() || slice >= 32) &&
+			                          (found->second.clear_mask & (1u << slice)) != 0;
+			if (locked != m_meta_clear_memo.result) {
+				EXIT("TextureCache: metadata-clear memo mismatch addr=0x%016" PRIx64
+				     " slice=%u memo=%d locked=%d\n",
+				     address, slice, static_cast<int>(m_meta_clear_memo.result),
+				     static_cast<int>(locked));
+			}
+			return locked;
+		}
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	bool result;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto       found = m_surface_metas.find(address);
+		result = !(found == m_surface_metas.end() || slice >= 32) &&
+		         (found->second.clear_mask & (1u << slice)) != 0;
+	}
+	if (memo_enabled) {
+		m_meta_clear_memo = {generation, address, slice, result};
+	}
+	return result;
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -1920,6 +2125,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	NoteSurfaceMetaChange();
 	return true;
 }
 
@@ -1929,10 +2135,14 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
 	}
+	const auto mask = found->second.clear_mask;
 	if (is_clear) {
 		found->second.clear_mask |= 1u << slice;
 	} else {
 		found->second.clear_mask &= ~(1u << slice);
+	}
+	if (found->second.clear_mask != mask) {
+		NoteSurfaceMetaChange();
 	}
 	return true;
 }
@@ -1946,6 +2156,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
 			metadata = m_surface_metas.erase(metadata);
+			NoteSurfaceMetaChange();
 		} else {
 			++metadata;
 		}
@@ -1963,16 +2174,41 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	if (m_gc_frame != m_gc_seen_frame) {
+		const auto frames = m_gc_frame > m_gc_seen_frame ? m_gc_frame - m_gc_seen_frame : 1;
+		if (m_gc_seen_frame != 0) {
+			m_gc_ticks_per_frame = (tick - m_gc_frame_tick) / frames;
+		}
+		m_gc_seen_frame = m_gc_frame;
+		m_gc_frame_tick = tick;
+	}
+	// KYTY_UFC_TEX_GC_FRAMES=1: GC ticks advance once per command-processor pass (~100-150 per
+	// UFC frame), so the 16/80-tick ages retire images every frame reuses (~30 deletions and
+	// re-creations per frame). Below the critical threshold, retire only images unused for two
+	// frames, as the buffer cache does.
+	static const bool frame_age_enabled = [] {
+		const char* value = std::getenv("KYTY_UFC_TEX_GC_FRAMES"); // Dev 094 all-on bisect: on by default, =0 turns it off
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	const uint64_t frame_age =
+	    frame_age_enabled ? std::min<uint64_t>(2 * m_gc_ticks_per_frame, 4096) : 0;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	if (VramBudget::GcEnabled() && m_graphics.CanReportMemoryUsage() &&
+	    !RunBudgetGarbageCollector(tick)) {
+		return;
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	KYTY_PROFILER_BLOCK("TextureCache::RunGarbageCollector");
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		const uint64_t base_age  = aggressive ? 160 : pressured ? 80 : 16;
+		const uint64_t age =
+		    std::min<uint64_t>(aggressive ? base_age : std::max(base_age, frame_age), tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
@@ -2003,6 +2239,8 @@ void TextureCache::RunGarbageCollector() {
 					continue;
 				}
 			}
+			KYTY_PROFILER_BLOCK("TextureCache::GcFreeImage");
+			WaitStats::NoteBdaFaults(2, 1);
 			FreeImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
@@ -2018,6 +2256,100 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
+}
+
+bool TextureCache::RunBudgetGarbageCollector(uint64_t tick) {
+	const uint64_t frame = m_gc_frame;
+	if (m_budget_frame_ticks.empty() || m_budget_frame_ticks.back().first != frame) {
+		m_budget_frame_ticks.emplace_back(frame, tick);
+	}
+	while (m_budget_frame_ticks.size() > VramBudget::AgeFrames() + 64) {
+		m_budget_frame_ticks.pop_front();
+	}
+	// Once per guest frame: this runs on the GPU thread after every completed submission.
+	if (frame != m_budget_frame) {
+		m_budget_frame = frame;
+		m_budget_last  = m_graphics.GetTotalMemoryBudget();
+		const auto plan =
+		    VramBudget::PlanImages(m_budget_last, m_total_used_memory, VramBudget::AgeFrames());
+		if (plan.retire) {
+			KYTY_PROFILER_BLOCK("TextureCache::RunBudgetGarbageCollector");
+			m_budget_freed_bytes += RetireUnusedImages(plan.age_frames, 256, plan.bytes);
+		}
+		if (frame >= m_budget_next_log) {
+			m_budget_next_log      = frame + 600;
+			constexpr uint64_t MiB = 1024ull * 1024;
+			Log::WriteToConsoleAndLog(
+			    "VRAM GC budget: frame " + std::to_string(frame) + ", budget " +
+			    std::to_string(m_budget_last / MiB) + " MiB, usage " +
+			    std::to_string(m_total_used_memory / MiB) + " MiB, images freed " +
+			    std::to_string(m_budget_freed) + " (" + std::to_string(m_budget_freed_bytes / MiB) +
+			    " MiB), stock last-resort passes " + std::to_string(m_budget_last_resort) + "\n");
+		}
+	}
+	// No budget: the stock collection. Above the budget itself: the stock collector (downloads,
+	// GPU waits) as the last resort.
+	const bool last_resort = m_budget_last == 0 || m_total_used_memory >= m_budget_last;
+	if (last_resort) {
+		++m_budget_last_resort;
+	}
+	return last_resort;
+}
+
+uint64_t TextureCache::RetireUnusedImages(uint64_t min_age_frames, size_t max_count,
+                                          uint64_t enough) {
+	const uint64_t frame = m_gc_frame;
+	if (frame <= min_age_frames) {
+		return 0;
+	}
+	// The GC tick at which the newest recorded frame not after frame - min_age began. LRU ticks
+	// are GC ticks: an image last touched below that tick was last used before that frame, i.e.
+	// more than min_age frames ago. Frames missing from the record make this only older.
+	const uint64_t limit_frame = frame - min_age_frames;
+	const auto     newer =
+	    std::upper_bound(m_budget_frame_ticks.begin(), m_budget_frame_ticks.end(), limit_frame,
+	                     [](uint64_t value, const std::pair<uint64_t, uint64_t>& entry) {
+		                     return value < entry.first;
+	                     });
+	if (newer == m_budget_frame_ticks.begin()) {
+		return 0; // not enough history yet
+	}
+	const uint64_t limit_tick = std::prev(newer)->second;
+	if (limit_tick == 0) {
+		return 0;
+	}
+	const auto retirable = [](const Image& image) {
+		// Clean of GPU writes (the guest bytes hold the contents; a later use re-creates and
+		// re-uploads it), not a depth/stencil association, not bound, not a render target, not a
+		// presentation surface. Never a download, never a GPU wait.
+		return image.registered && !image.depth_id && !image.IsGpuModified() &&
+		       !image.binding.is_bound && !image.binding.is_target && !image.usage.video_out;
+	};
+	std::vector<ImageId> candidates;
+	size_t               scanned = 0;
+	// Oldest first, bounded per pass; entries it may not free are passed over.
+	m_lru_cache.ForEachItemBelow(limit_tick - 1, [&](ImageId id) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image != nullptr && retirable(*image)) {
+			candidates.push_back(id);
+		}
+		return ++scanned >= 16384 || candidates.size() >= max_count;
+	});
+	uint64_t freed = 0;
+	for (const auto id: candidates) {
+		if (freed >= enough) {
+			break;
+		}
+		// Freeing a depth image frees its stencil associations: check again.
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !retirable(*image)) {
+			continue;
+		}
+		freed += image->AccountedSize();
+		FreeImage(id);
+		++m_budget_freed;
+	}
+	return freed;
 }
 
 void TextureCache::ProcessDownloadImages() {

@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/NanTrace.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -513,6 +514,8 @@ void DefineGetBdaPointer(EmitterState& state);
 void DefineBvhIntersect(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value);
+// KYTY_UFC_NAN_TRACE=1: reports the first NaN/Inf a write site produces (value is an f32 vec4).
+void     EmitNanTraceCheck(EmitterState& state, uint32_t value, NanTrace::Site site, uint32_t index);
 uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high);
 
 // These templates accept local lambdas from several emitter translation units.

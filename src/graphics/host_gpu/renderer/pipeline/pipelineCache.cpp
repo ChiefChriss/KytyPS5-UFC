@@ -11,10 +11,13 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/NanTrace.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -24,11 +27,17 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <mutex>
+#include <unordered_set>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <limits>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -39,6 +48,24 @@
 namespace Libs::Graphics {
 
 namespace {
+
+struct ShaderBuildTimes {
+	std::atomic<uint64_t> translate_ns {0};
+	std::atomic<uint64_t> compile_ns {0};
+	std::atomic<uint64_t> validate_ns {0};
+	std::atomic<uint64_t> module_ns {0};
+	std::atomic<uint64_t> pipeline_ns {0};
+	std::atomic<uint64_t> pipelines {0};
+};
+ShaderBuildTimes& BuildTimes() {
+	static ShaderBuildTimes times;
+	return times;
+}
+uint64_t SteadyNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
@@ -69,7 +96,7 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n",
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
@@ -137,9 +164,88 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 	file.Write(code.data(), code.size_bytes());
 }
 
+// SPIR-V that already passed validation once (same bytes, same SPIRV-Tools build) is recorded
+// on disk, so later launches skip the validator for it. In UFC 5 validation was ~60% of all shader
+// build time (~7 ms per shader, ~5.5 s per session), stalling intros and menus. New or changed
+// SPIR-V is still validated. KYTY_UFC_SPIRV_VALIDATION_CACHE=0 disables the cache.
+class ValidatedSpirvCache {
+public:
+	static ValidatedSpirvCache& Instance() {
+		static ValidatedSpirvCache cache;
+		return cache;
+	}
+	[[nodiscard]] bool Contains(const XXH128_hash_t& hash) {
+		std::scoped_lock lock(m_mutex);
+		return m_enabled && m_entries.contains(Key(hash));
+	}
+	void Add(const XXH128_hash_t& hash) {
+		std::scoped_lock lock(m_mutex);
+		if (!m_enabled || !m_entries.insert(Key(hash)).second || m_file == nullptr) {
+			return;
+		}
+		std::fwrite(&hash, sizeof(hash), 1, m_file);
+		std::fflush(m_file);
+	}
+
+private:
+	static std::pair<uint64_t, uint64_t> Key(const XXH128_hash_t& hash) {
+		return {hash.low64, hash.high64};
+	}
+	struct PairHash {
+		size_t operator()(const std::pair<uint64_t, uint64_t>& value) const noexcept {
+			return static_cast<size_t>(value.first ^ (value.second * 0x9e3779b97f4a7c15ull));
+		}
+	};
+	ValidatedSpirvCache() {
+		const char* setting = std::getenv("KYTY_UFC_SPIRV_VALIDATION_CACHE");
+		m_enabled           = setting == nullptr || std::strcmp(setting, "0") != 0;
+		if (!m_enabled) {
+			return;
+		}
+		// Header: format tag and the validator build; any mismatch starts a new file.
+		const std::string header =
+		    fmt::format("KYTY-SPIRV-VALID-1 {} vulkan1.3\n", spvSoftwareVersionDetailsString());
+		const auto path = std::filesystem::path("_PipelineCache") / "validated_spirv.bin";
+		std::error_code error;
+		std::filesystem::create_directories(path.parent_path(), error);
+		bool reuse = false;
+		if (std::FILE* in = std::fopen(Common::PathToString(path).c_str(), "rb"); in != nullptr) {
+			std::string existing(header.size(), '\0');
+			reuse = std::fread(existing.data(), 1, existing.size(), in) == existing.size() &&
+			        existing == header;
+			XXH128_hash_t hash {};
+			while (reuse && std::fread(&hash, sizeof(hash), 1, in) == 1) {
+				m_entries.insert(Key(hash));
+			}
+			std::fclose(in);
+		}
+		m_file = std::fopen(Common::PathToString(path).c_str(), reuse ? "ab" : "wb");
+		if (m_file != nullptr && !reuse) {
+			std::fwrite(header.data(), 1, header.size(), m_file);
+			std::fflush(m_file);
+		}
+		std::printf("SPIR-V validation cache: %zu known-valid shaders%s\n", m_entries.size(),
+		            m_file == nullptr ? " (read-only)" : "");
+	}
+	~ValidatedSpirvCache() {
+		if (m_file != nullptr) {
+			std::fclose(m_file);
+		}
+	}
+	std::mutex                                                     m_mutex;
+	std::unordered_set<std::pair<uint64_t, uint64_t>, PairHash>    m_entries;
+	std::FILE*                                                     m_file    = nullptr;
+	bool                                                           m_enabled = true;
+};
+
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
                          const std::vector<uint32_t>& spirv) {
 	if (!Config::ShaderValidationEnabled()) {
+		return true;
+	}
+	const auto spirv_hash = XXH3_128bits(spirv.data(), spirv.size() * sizeof(uint32_t));
+	auto&      known      = ValidatedSpirvCache::Instance();
+	if (known.Contains(spirv_hash)) {
 		return true;
 	}
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
@@ -151,6 +257,7 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 		                        message);
 	});
 	if (tools.Validate(spirv)) {
+		known.Add(spirv_hash);
 		return true;
 	}
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
@@ -213,17 +320,217 @@ struct PipelineCache::ProgramCache {
 		ShaderProgram                                handle;
 	};
 
+	// One cached materialization of a source (KYTY_UFC_SRT_MEMO). The `reads` log is the
+	// invalidation proof: ReplaySrtReads proves the guest-memory reads are unchanged, and the
+	// user-data mask proves the read SGPRs are unchanged, so `resources`/`specialization` are
+	// exactly what a fresh MaterializeResources would produce for those inputs.
+	struct MemoSlot {
+		bool                                         valid       = false;
+		uint64_t                                     shader_base = 0;
+		std::vector<uint32_t>                        user_data;
+		ShaderRecompiler::IR::SrtReadLog             reads;
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+	};
+
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {
 			permutations.reserve(8);
 		}
 
-		ShaderRecompiler::IR::ResourcePlan           resource_plan;
-		ShaderRecompiler::IR::ResourceSnapshot       resources;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                     permutations;
+		ShaderRecompiler::IR::ResourcePlan resource_plan;
+		std::vector<Permutation>           permutations;
+		// Bounded per-source memo of materializations. Only slot 0 is used unless
+		// KYTY_UFC_SRT_MEMO_SLOTS raises the count; more slots let a source whose draws interleave
+		// several (shader base, user data) keys reuse an older materialization instead of only the
+		// immediately preceding one.
+		std::vector<MemoSlot> memos;
+		uint32_t              next_slot = 0;
+		ShaderDiskCache::Bytes disk_key;
 	};
+
+	static bool DiskAllowed() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_SHADER_DISK_CACHE");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		// Traced shaders embed this process's diagnostic address and reserve push word 31.
+		return enabled && !ShaderRecompiler::NanTrace::Active() && !Config::GraphicsDebugDumpEnabled();
+	}
+	void EnsureDisk() {
+		if (disk || !DiskAllowed()) return;
+		const auto title = PipelineCacheTitleId();
+		if (title.empty()) return;
+		disk = std::make_unique<ShaderDiskCache::Store>(std::filesystem::path("_ShaderCache") / title);
+		PipelineCacheLog("Shader disk cache: _ShaderCache/{} (source {})", title, ShaderDiskCache::BuildFingerprint());
+	}
+	ShaderDiskCache::Bytes SourceDiskKey(const ShaderParams& params) {
+		ShaderDiskCache::ByteWriter key;
+		ShaderDiskCache::AppendSession(key);
+		key.Put<uint8_t>('S');
+		key.Put(properties.vendorID); key.Put(properties.deviceID); key.Put(properties.driverVersion);
+		for (auto byte: properties.pipelineCacheUUID) key.Put(byte);
+		key.Put(Config::GetShaderOptimizationType());
+		key.Put(lookup_key.stage); key.Put(params.hash); key.Put(params.user_data_count);
+		key.Words(params.code); key.Words(params.back_code); key.Words(lookup_key.static_state);
+		return std::move(key.bytes);
+	}
+	ShaderDiskCache::Bytes PermutationDiskKey(const SourceEntry& source,
+	                                         const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                         uint32_t push_cursor) {
+		ShaderDiskCache::ByteWriter key;
+		key.Put<uint8_t>('P'); key.Put<uint64_t>(source.disk_key.size()); key.PutBytes(source.disk_key);
+		ShaderDiskCache::AppendSpecialization(key, specialization); key.Put(push_cursor);
+		return std::move(key.bytes);
+	}
+	void SaveSource(const ShaderDiskCache::Bytes& key, const ShaderRecompiler::IR::ResourcePlan& plan) {
+		if (!disk || !DiskAllowed() || key.empty()) return;
+		ShaderDiskCache::Bytes payload, checked;
+		ShaderRecompiler::IR::ResourcePlan decoded;
+		if (ShaderDiskCache::EncodeSource(plan, payload) && ShaderDiskCache::DecodeSource(payload, decoded) &&
+		    ShaderDiskCache::EncodeSource(decoded, checked) && payload == checked)
+			disk->Save(key, std::move(payload));
+	}
+	void FlushDisk() {
+		if (!disk) return;
+		disk->Flush();
+		PipelineCacheLog("Shader disk cache: source hits={} permutation hits={} misses={} rejected={} writes={} dropped={}",
+		                 source_hits, permutation_hits, disk->counters.misses, disk->counters.rejected,
+		                 disk->counters.queued, disk->counters.dropped);
+	}
+
+	// KYTY_UFC_SRT_MEMO: unset/0 off, 1 reuse the previous materialization when its inputs and
+	// every guest-memory read are unchanged, "shadow" also recompute and count mismatches.
+	static int SrtMemoMode() {
+		static const int mode = [] {
+			const char* value = std::getenv("KYTY_UFC_SRT_MEMO");
+			if (value == nullptr) return 1; // Dev 094 all-on bisect: on by default, =0 turns it off (shadow = verify)
+			if (std::strcmp(value, "1") == 0) return 1;
+			if (std::strcmp(value, "shadow") == 0) return 2;
+			return 0;
+		}();
+		return mode;
+	}
+
+	// KYTY_UFC_SRT_MEMO_SLOTS: per-source memo capacity, clamped to [1, 64]; default 1 keeps the
+	// original single-slot behavior. Only meaningful while SrtMemoMode() != 0.
+	static size_t SrtMemoSlots() {
+		static const size_t slots = [] {
+			const char* value = std::getenv("KYTY_UFC_SRT_MEMO_SLOTS");
+			if (value == nullptr) return size_t {1};
+			const long parsed = std::strtol(value, nullptr, 10);
+			if (parsed < 1) return size_t {1};
+			if (parsed > 64) return size_t {64};
+			return static_cast<size_t>(parsed);
+		}();
+		return slots;
+	}
+
+	static bool SameSnapshot(const ShaderRecompiler::IR::ResourceSnapshot& a,
+	                         const ShaderRecompiler::IR::ResourceSnapshot& b) {
+		return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
+		       a.flattened_srt == b.flattened_srt && a.user_data == b.user_data &&
+		       a.specialization_reads == b.specialization_reads && a.uniform_fill == b.uniform_fill;
+	}
+
+	// True when the memo slot was materialized with the same shader base and the same user-data
+	// words that its own evaluation read. Unread user-data words reach the result only through
+	// ResourceSnapshot::user_data, which the caller copies in.
+	static bool MemoInputsMatch(const MemoSlot&                              slot,
+	                            const ShaderRecompiler::IR::SrtRuntime&      runtime) {
+		if (!slot.valid || slot.shader_base != runtime.shader_base ||
+		    slot.user_data.size() != runtime.user_data.size()) {
+			return false;
+		}
+		const auto mask = slot.reads.user_data_mask;
+		if ((mask >> 63u) != 0u) {
+			return std::ranges::equal(slot.user_data, runtime.user_data);
+		}
+		for (size_t i = 0; i < slot.user_data.size() && i < 63; ++i) {
+			if (((mask >> i) & 1u) != 0u && slot.user_data[i] != runtime.user_data[i]) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	static void MaterializeSlot(SourceEntry& source, MemoSlot& slot,
+	                            const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                            ShaderRecompiler::IR::SrtReadLog*       log) {
+		slot.valid = false;
+		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime,
+		                                                    slot.resources, slot.specialization,
+		                                                    log));
+		if (ShaderRecompiler::IR::SrtNativeStats stats;
+		    ShaderRecompiler::IR::TakeSrtNativeReport(stats)) {
+			PipelineCacheLog("SRT native: {} plans, {} failed, {} KiB, {} instructions, {} interpreted",
+			                 stats.plans, stats.failed, stats.bytes / 1024u,
+			                 stats.instructions, stats.interpreted);
+		}
+		slot.shader_base = runtime.shader_base;
+		slot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+		slot.valid = true;
+	}
+
+	// Returns the memo slot holding the materialization for this runtime. The caller must keep the
+	// source alive and must not call this again for the same source before consuming the result.
+	static MemoSlot& MaterializeSource(SourceEntry& source, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                                   uint64_t shader_hash) {
+		if (source.memos.empty()) {
+			source.memos.resize(SrtMemoSlots());
+		}
+		auto&     memos = source.memos;
+		const int mode  = SrtMemoMode();
+		if (mode == 0) {
+			MaterializeSlot(source, memos[0], runtime, nullptr);
+			return memos[0];
+		}
+		MemoSlot* hit          = nullptr;
+		bool      inputs_found = false;
+		for (auto& slot: memos) {
+			if (!MemoInputsMatch(slot, runtime)) {
+				continue;
+			}
+			inputs_found      = true;
+			uint64_t replayed = 0;
+			if (ShaderRecompiler::IR::ReplaySrtReads(runtime, slot.reads, replayed)) {
+				WaitStats::NoteSrtMemo(4, replayed);
+				hit = &slot;
+				break;
+			}
+		}
+		if (hit != nullptr) {
+			WaitStats::NoteSrtMemo(0);
+			if (mode == 1) {
+				// Unread user-data words only reach the result through this copy.
+				hit->resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+				return *hit;
+			}
+			// Shadow mode: recompute and compare, keeping the freshly computed result in the slot.
+			auto shadow_resources = hit->resources;
+			shadow_resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+			auto shadow_specialization = hit->specialization;
+			auto shadow_active         = source.resource_plan.active_sources;
+			MaterializeSlot(source, *hit, runtime, &hit->reads);
+			if (!(SameSnapshot(shadow_resources, hit->resources) &&
+			      shadow_specialization == hit->specialization &&
+			      shadow_active == source.resource_plan.active_sources)) {
+				WaitStats::NoteSrtMemo(3);
+				static std::atomic_uint reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+					PipelineCacheLog("SRT memo shadow MISMATCH: shader hash={:016x} reads={}", shader_hash,
+					                 hit->reads.records.size());
+				}
+			}
+			return *hit;
+		}
+		WaitStats::NoteSrtMemo(inputs_found ? 2 : 1);
+		MemoSlot& slot   = memos[source.next_slot];
+		source.next_slot = (source.next_slot + 1u) % static_cast<uint32_t>(memos.size());
+		MaterializeSlot(source, slot, runtime, &slot.reads);
+		return slot;
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -247,17 +554,35 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	                               uint32_t push_data_start_dword,
+	                               const ShaderDiskCache::Bytes& disk_key = {}) {
+		const auto compile_begin = SteadyNs();
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+		const auto validate_begin = SteadyNs();
+		BuildTimes().compile_ns.fetch_add(validate_begin - compile_begin, std::memory_order_relaxed);
+		const bool valid = ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv);
+		const auto module_begin = SteadyNs();
+		BuildTimes().validate_ns.fetch_add(module_begin - validate_begin, std::memory_order_relaxed);
+		if (!valid) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		auto program = std::move(result.program).TakeCompiledInfo();
+		if (disk && DiskAllowed() && !disk_key.empty()) {
+			ShaderDiskCache::Bytes payload, checked;
+			std::vector<uint32_t> decoded_spirv;
+			ShaderRecompiler::IR::CompiledShaderInfo decoded;
+			if (ShaderDiskCache::EncodePermutation(result.spirv, program, payload) &&
+			    ShaderDiskCache::DecodePermutation(payload, decoded_spirv, decoded) &&
+			    ShaderDiskCache::EncodePermutation(decoded_spirv, decoded, checked) && payload == checked)
+				disk->Save(disk_key, std::move(payload));
+		}
 
 		const auto module = CompileSPV(result.spirv, device);
+		BuildTimes().module_ns.fetch_add(SteadyNs() - module_begin, std::memory_order_relaxed);
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -265,7 +590,7 @@ struct PipelineCache::ProgramCache {
 		}
 		return {
 		    .specialization = std::move(specialization),
-		    .program        = std::move(result.program).TakeCompiledInfo(),
+		    .program        = std::move(program),
 		    .handle         = {.id = ++next_shader_id, .module = module},
 		};
 	}
@@ -299,12 +624,29 @@ struct PipelineCache::ProgramCache {
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
+		ShaderDiskCache::Bytes source_disk_key;
+		if (entry == programs.end() && DiskAllowed()) {
+			EnsureDisk();
+			if (disk) {
+				source_disk_key = SourceDiskKey(params);
+				ShaderDiskCache::Bytes payload;
+				ShaderRecompiler::IR::ResourcePlan plan;
+				if (disk->Load(source_disk_key, payload)) {
+					if (ShaderDiskCache::DecodeSource(payload, plan) && plan.stage == stage &&
+					    plan.shader_hash == params.hash && plan.user_data_count == params.user_data_count) {
+						entry = programs.try_emplace(lookup_key, std::move(plan)).first;
+						entry->second.disk_key = source_disk_key;
+						source_hits++;
+					} else disk->counters.rejected++;
+				}
+			}
+		}
+		MemoSlot* slot = nullptr;
 		if (entry != programs.end()) {
 			{
 				KYTY_PROFILER_BLOCK("Shader::MaterializeResources");
-				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-				    entry->second.resource_plan, runtime, entry->second.resources,
-				    entry->second.specialization));
+				const ScopedSrtEvaluation srt_evaluation;
+				slot = &MaterializeSource(entry->second, runtime, params.hash);
 			}
 			KYTY_PROFILER_BLOCK("Shader::FindPermutation");
 			if (const auto permutation = std::ranges::find_if(
@@ -313,12 +655,15 @@ struct PipelineCache::ProgramCache {
 				        const auto& layout = candidate.program.bindings;
 				        return layout.push_data_start_dword ==
 				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
+				                       push_data_cursor, layout.ShaderDataDwords(),
+				                       ShaderRecompiler::NanTrace::Active()
+				                           ? ShaderRecompiler::NanTrace::EventPushDword
+				                           : ShaderRecompiler::IR::PushData::DwordCount) &&
+				               candidate.specialization == slot->specialization;
 			        });
 			    permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
-				                    .resources = &entry->second.resources};
+				                    .resources = &slot->resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -386,24 +731,67 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		ShaderDiskCache::Bytes permutation_disk_key;
+		if (DiskAllowed()) {
+			EnsureDisk();
+			if (disk && entry != programs.end()) {
+				if (entry->second.disk_key.empty()) entry->second.disk_key = SourceDiskKey(params);
+				permutation_disk_key = PermutationDiskKey(entry->second, slot->specialization, push_data_cursor);
+				ShaderDiskCache::Bytes payload;
+				std::vector<uint32_t> spirv;
+				ShaderRecompiler::IR::CompiledShaderInfo program;
+				if (disk->Load(permutation_disk_key, payload)) {
+					if (ShaderDiskCache::DecodePermutation(payload, spirv, program) &&
+					    program.stage == stage && program.shader_hash == params.hash &&
+					    program.wave_size == options.wave_size && program.user_data_base == options.user_data_base &&
+					    program.user_data_count == params.user_data_count &&
+					    program.bindings.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
+					        push_data_cursor, program.bindings.ShaderDataDwords()) &&
+					    ValidateShaderSpirv(label, params.hash, spirv)) {
+						const auto module = CompileSPV(spirv, device);
+						EXIT_IF(module == nullptr);
+						entry->second.permutations.push_back({slot->specialization, std::move(program),
+						    {.id = ++next_shader_id, .module = module}});
+						const auto& cached = entry->second.permutations.back();
+						input_info.stage = {.program = &cached.program, .resources = &slot->resources};
+						cached.program.bindings.AdvancePushData(push_data_cursor);
+						if (++permutation_hits <= 8 || permutation_hits % 128 == 0)
+							PipelineCacheLog("Shader disk cache hit: stage={} hash={:016x} total={}",
+							                 stage_name, params.hash, permutation_hits);
+						return cached.handle;
+					}
+					disk->counters.rejected++;
+				}
+			}
+		}
+		const auto translate_begin = SteadyNs();
 		auto translated = [&] {
 			KYTY_PROFILER_BLOCK("Shader::TranslateProgram");
 			return ShaderRecompiler::TranslateProgram(params.code, options);
 		}();
+		BuildTimes().translate_ns.fetch_add(SteadyNs() - translate_begin,
+		                                    std::memory_order_relaxed);
 		if (entry == programs.end()) {
-			entry = programs
-			            .try_emplace(lookup_key,
-			                         ShaderRecompiler::IR::ExtractResourcePlan(translated.program))
-			            .first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan,
-			                                                    runtime, entry->second.resources,
-			                                                    entry->second.specialization));
+			// Load-window attribution (Dev 118): time the un-zoned ResourcePlan extraction.
+			ShaderRecompiler::IR::ResourcePlan plan;
+			{
+				KYTY_PROFILER_BLOCK("Shader::ExtractPlan");
+				plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			}
+			entry = programs.try_emplace(lookup_key, std::move(plan)).first;
+			if (disk && DiskAllowed()) {
+				entry->second.disk_key = source_disk_key.empty() ? SourceDiskKey(params) : std::move(source_disk_key);
+				SaveSource(entry->second.disk_key, entry->second.resource_plan);
+			}
+			slot  = &MaterializeSource(entry->second, runtime, params.hash);
 		}
+		if (disk && DiskAllowed() && permutation_disk_key.empty())
+			permutation_disk_key = PermutationDiskKey(entry->second, slot->specialization, push_data_cursor);
 		{
 			KYTY_PROFILER_BLOCK("Shader::CompilePermutation");
 			entry->second.permutations.push_back(
 			    CompilePermutation(stage_name, options, std::move(translated),
-			                       entry->second.specialization, push_data_cursor));
+			                       slot->specialization, push_data_cursor, permutation_disk_key));
 		}
 		const auto& permutation       = entry->second.permutations.back();
 		const auto  permutation_count = entry->second.permutations.size();
@@ -427,26 +815,41 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 		}
-		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
+		input_info.stage = {.program = &permutation.program, .resources = &slot->resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
-		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+		// Load-window attribution (Dev 118): the retained build-stats print walks every program and
+		// writes to the (possibly pipe-backed) console on the GPU command thread. Time it so a
+		// multi-second parent stall can be attributed to it rather than to shader work.
+		{
+			KYTY_PROFILER_BLOCK("Shader::BuildStatsPrintf");
+			std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
+			for (const auto& [key, source]: programs) {
+				counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+			}
+			// Guest geometry shaders are compiled through the host mesh stage.
+			auto& times = BuildTimes();
+			std::printf("Shader build ms: translate %.0f compile %.0f validate %.0f module %.0f | "
+			            "pipelines %llu in %.0f ms\n",
+			            static_cast<double>(times.translate_ns.load()) / 1e6,
+			            static_cast<double>(times.compile_ns.load()) / 1e6,
+			            static_cast<double>(times.validate_ns.load()) / 1e6,
+			            static_cast<double>(times.module_ns.load()) / 1e6,
+			            static_cast<unsigned long long>(times.pipelines.load()),
+			            static_cast<double>(times.pipeline_ns.load()) / 1e6);
+			std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
+			            counts[static_cast<size_t>(ShaderType::Vertex)],
+			            counts[static_cast<size_t>(ShaderType::Pixel)],
+			            counts[static_cast<size_t>(ShaderType::Compute)],
+			            counts[static_cast<size_t>(ShaderType::Mesh)],
+			            counts[static_cast<size_t>(ShaderType::Local)],
+			            counts[static_cast<size_t>(ShaderType::TessellationControl)],
+			            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		}
-		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)],
-		            counts[static_cast<size_t>(ShaderType::Local)],
-		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
-		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	explicit ProgramCache(vk::Device device, vk::PhysicalDeviceProperties properties): device(device), properties(properties) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -461,11 +864,14 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	vk::PhysicalDeviceProperties                                properties;
+	std::unique_ptr<ShaderDiskCache::Store>                      disk;
+	uint64_t                                                    source_hits = 0, permutation_hits = 0;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.GetPhysicalDeviceProperties())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }
@@ -494,16 +900,6 @@ void PipelineCache::InitializeDriverCache() {
 	}
 	if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
-		return;
-	}
-	const std::string_view git_hash     = KYTY_GIT_HASH;
-	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
 		return;
 	}
 
@@ -573,7 +969,13 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
+void NotePipelineBuildNs(uint64_t nanoseconds) noexcept {
+	BuildTimes().pipeline_ns.fetch_add(nanoseconds, std::memory_order_relaxed);
+	BuildTimes().pipelines.fetch_add(1, std::memory_order_relaxed);
+}
+
 void PipelineCache::Save() {
+	m_program_cache->FlushDisk();
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -703,9 +1105,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.half_extent[1] =
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
+		clip.dynamic = true;
 	}
 	uint32_t push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	if (vertex_info[tess_active ? 2u : 0u].clip_space.enabled) {
+		push_data_cursor += ShaderRecompiler::IR::PushData::ClipTransformDwordCount;
+	}
 	GraphicsPrograms result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
@@ -720,7 +1126,12 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
-	const auto        params      = PrepareProgram(regs, sh, input_info);
+	// Load-window attribution (Dev 118): isolate the un-zoned PrepareProgram step from the
+	// program-cache lookup inside CS::GetProgram. Inert without Tracy.
+	const auto params = [&] {
+		KYTY_PROFILER_BLOCK("CS::PrepareProgram");
+		return PrepareProgram(regs, sh, input_info);
+	}();
 	// Use one effective size for the cache key, LDS declaration, and access bounds.
 	const auto max_lds_dwords =
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
@@ -734,7 +1145,8 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		}
 	}
 	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);
-	uint32_t          push_data_cursor = 0;
+	uint32_t push_data_cursor  = 0;
+	KYTY_PROFILER_BLOCK("CS::ProgramCacheGet");
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
 

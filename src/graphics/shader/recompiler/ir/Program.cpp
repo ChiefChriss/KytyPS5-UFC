@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <fmt/format.h>
+#include <functional>
 #include <map>
 #include <new>
 #include <unordered_map>
@@ -54,8 +55,23 @@ bool IsRuntimeRead(ValueOpcode opcode) {
 	       AddressOpcodeInfoOf(opcode).access == AddressAccess::Read;
 }
 
+// Visited-pair set for EquivalentValue cycle detection. A linear scan over a growing vector is
+// O(N^2); EquivalentValue is called for every branch value in ResolveInvariantPhi, which
+// ExtractResourcePlan runs per Phi, so the stall showed up as a multi-second shader-plan build.
+// Hashing the instruction pair keeps the exact same membership semantics in amortized O(1).
+struct InstPairHash {
+	size_t operator()(const std::pair<const Inst*, const Inst*>& pair) const {
+		const auto first  = std::hash<const void*> {}(pair.first);
+		const auto second = std::hash<const void*> {}(pair.second);
+		return first ^ (second + static_cast<size_t>(0x9e3779b97f4a7c15ull) + (first << 6u) +
+		                (first >> 2u));
+	}
+};
+
+using VisitedInstPairs = std::unordered_set<std::pair<const Inst*, const Inst*>, InstPairHash>;
+
 bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
-                     std::vector<std::pair<const Inst*, const Inst*>>& visited) {
+                     VisitedInstPairs& visited) {
 	left  = left.Resolve();
 	right = right.Resolve();
 	if (left == right) {
@@ -70,10 +86,10 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 	    lhs->NumArgs() != rhs->NumArgs()) {
 		return false;
 	}
-	if (std::ranges::find(visited, std::pair {lhs, rhs}) != visited.end()) {
+	if (visited.contains({lhs, rhs})) {
 		return true;
 	}
-	visited.emplace_back(lhs, rhs);
+	visited.insert({lhs, rhs});
 	if (IsRuntimeRead(lhs->GetOpcode())) {
 		const auto li = lhs->Flags<MemoryFlags>().index;
 		const auto ri = rhs->Flags<MemoryFlags>().index;
@@ -100,7 +116,7 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 
 ResourcePlan::~ResourcePlan() {
 	for (auto& inst: value_storage) {
-		inst.Invalidate();
+		inst.DropForDestruction();
 	}
 }
 
@@ -115,13 +131,13 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
 Program::~Program() {
 	// Planning expressions can refer to block values but outlive block storage in the base class.
 	for (auto& inst: value_storage) {
-		inst.Invalidate();
+		inst.DropForDestruction();
 	}
 	// Values may cross block boundaries. Detach all arguments before any block starts destroying
 	// its instruction storage so reverse-use links always point to live definitions.
 	for (auto* block: blocks) {
 		for (auto& inst: *block) {
-			inst.Invalidate();
+			inst.DropForDestruction();
 		}
 	}
 }
@@ -155,7 +171,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 }
 
 bool EquivalentValue(const ResourcePlan& program, Value left, Value right) {
-	std::vector<std::pair<const Inst*, const Inst*>> visited;
+	VisitedInstPairs visited;
 	return EquivalentValue(program, left, right, visited);
 }
 

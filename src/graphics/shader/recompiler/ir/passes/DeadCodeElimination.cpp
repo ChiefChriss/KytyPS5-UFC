@@ -1,10 +1,14 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 
 #include <algorithm>
+#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 void RemoveIdentities(const BlockList& blocks) {
+	std::unordered_set<const Inst*> removed;
+	std::vector<Inst*> touched;
 	for (auto* block: blocks) {
 		auto& instructions = block->Instructions();
 		for (auto inst = instructions.begin(); inst != instructions.end();) {
@@ -13,10 +17,12 @@ void RemoveIdentities(const BlockList& blocks) {
 				continue;
 			}
 			const auto replacement = inst->Arg(0);
-			inst->ReplaceUsesWith(replacement, false);
+			inst->ReplaceUsesForRemoval(replacement, removed, touched);
+			removed.insert(&*inst);
 			inst = instructions.erase(inst);
 		}
 	}
+	Inst::DropRemovedUses(touched, removed);
 }
 
 void EliminateDeadCode(const BlockList& blocks) {

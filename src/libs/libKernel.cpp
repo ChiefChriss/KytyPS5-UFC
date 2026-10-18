@@ -1980,6 +1980,12 @@ int KYTY_SYSV_ABI ftruncate(int d, int64_t length) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelFtruncate(d, length));
 }
 
+int KYTY_SYSV_ABI truncate(const char* path, int64_t length) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelTruncate(path, length));
+}
+
 int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
 	PRINT_NAME();
 	return Network::Net::Socket(family, type, protocol);
@@ -2163,6 +2169,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("E6ao34wPw+U", stat);
 	LIB_FUNC("JGMio+21L4c", mkdir);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
+	LIB_FUNC("ayrtszI7GBg", Posix::truncate);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
 	LIB_FUNC("YCV5dGGBcCo", Posix::sem_wait);
@@ -3084,6 +3091,8 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("mBd4AfLP+u8", FileSystem::KernelPwritev);
 	LIB_FUNC("eV9wAD2riIA", FileSystem::KernelStat);
 	LIB_FUNC("kBwCPsYX-m4", FileSystem::KernelFstat);
+	LIB_FUNC("VW3TVZiM4-E", FileSystem::KernelFtruncate);
+	LIB_FUNC("WlyEA-sLDf0", FileSystem::KernelTruncate);
 	LIB_FUNC("AUXVxWeJU-A", FileSystem::KernelUnlink);
 	LIB_FUNC("52NcYU9+lEo", FileSystem::KernelRename);
 	LIB_FUNC("taRWhTJFTgE", FileSystem::KernelGetdirentries);

@@ -16,9 +16,30 @@ FATAL = re.compile(r'ErrorDeviceLost|VK_ERROR_DEVICE_LOST|--- Fatal Error ---|'
                    r'\[FATAL\]|SPIR-V validation failed|Validation Error|Assertion failed', re.I)
 
 
+def client_area(image):
+    """Drop the window title bar: captures of a windowed 16:9 game are taller than 16:9."""
+    width, height = image.size
+    expected = round(width * 9 / 16)
+    return image.crop((0, height - expected, width, height)) if height > expected + 4 else image
+
+
+def player_stamina_rows(image):
+    """Rows of the player's yellow-green stamina bar (top-left HUD, one fighter shown)."""
+    small = image.resize((400, 225))
+    bar = lambda r, g, b: b < 90 and g > 120 and (r > 120 or g > 150) and abs(r - g) < 140
+    rows = 0
+    for y in range(12, 60):
+        pixels = [small.getpixel((x, y)) for x in range(40, 170)]
+        if sum(bar(*p) for p in pixels) / len(pixels) > 0.45:
+            rows += 1
+    return rows
+
+
 def detect_fight(path):
     with Image.open(path) as image:
-        image = image.convert('RGB').resize((400, 230))
+        content = client_area(image.convert('RGB'))
+        stamina_rows = player_stamina_rows(content)
+        image = content.resize((400, 230))
         def fraction(box, predicate):
             pixels = list(image.crop(box).getdata())
             return sum(predicate(*p) for p in pixels) / max(1, len(pixels))
@@ -26,8 +47,10 @@ def detect_fight(path):
         white = lambda r, g, b: min(r, g, b) > 190 and max(r, g, b) - min(r, g, b) < 45
         bars = [fraction((22, 21, 128, 29), green), fraction((272, 21, 378, 29), green)]
         names = [fraction((20, 11, 128, 21), white), fraction((272, 11, 378, 21), white)]
-        return {'fight_candidate': min(bars) > 0.08 and min(names) > 0.015,
-                'stamina_fractions': bars, 'name_fractions': names}
+        both_bars = min(bars) > 0.08 and min(names) > 0.015
+        return {'fight_candidate': both_bars or stamina_rows >= 3,
+                'stamina_fractions': bars, 'name_fractions': names,
+                'player_stamina_rows': stamina_rows}
 
 
 class LogTail:
@@ -51,7 +74,16 @@ class LogTail:
 def publish(folder, state):
     temporary = folder / 'watch.tmp.json'
     temporary.write_text(json.dumps(state, indent=2), encoding='utf-8')
-    temporary.replace(folder / 'watch.json')
+    # AutoFight can briefly hold watch.json open on Windows while reading it. Keep the
+    # previous complete snapshot until replacement succeeds, and retry next poll if busy.
+    for attempt in range(20):
+        try:
+            temporary.replace(folder / 'watch.json')
+            return True
+        except PermissionError:
+            if attempt < 19:
+                time.sleep(0.05)
+    return False
 
 
 def main():
@@ -71,9 +103,9 @@ def main():
                         '# Correction required\n\n' + f'Source: {tail.path.name}\n\n```text\n{line}\n```\n'
                         'Read surrounding console output, fix the cause, rebuild, run regressions, and rerun.\n',
                         encoding='utf-8')
-                    publish(args.session, state)
                     print(f'correction required: {line}', flush=True)
-                    return
+                    if publish(args.session, state):
+                        return
         for shot in sorted(args.session.glob('shot_*.png')):
             if shot.name in seen:
                 continue
@@ -87,7 +119,8 @@ def main():
             if consecutive >= 2 and not state['fight_detected']:
                 state.update(fight_detected=True, first_fight_s=round(time.time() - args.start_epoch, 2))
                 print(f'fight HUD detected at {state["first_fight_s"]}s ({shot.name})', flush=True)
-        publish(args.session, state)
+        if publish(args.session, state) and state['action'] == 'stop':
+            return
         time.sleep(0.5 if state['fight_detected'] else 1.0)
 
 

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -94,6 +95,73 @@ constexpr size_t   PTHREAD_STACK_EXTRA     = 0x100000;
 constexpr uint64_t PTHREAD_STACK_TOP       = 0x7efff8000ull;
 constexpr uint64_t PTHREAD_STACK_BOTTOM    = 0x0000040000ull;
 constexpr uint32_t SIGNAL_APC_POLL_MICROS  = 10000;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+// Guest priority classes -> host thread priorities (ported from Jetsku 509f0be0).
+//
+// Default mapping (KYTY_UFC_GPU_PRIORITY unset): guest <= 478 -> +2 (HIGHEST), 479..732 -> 0
+// (NORMAL), >= 733 -> -2 (LOWEST), applied only through the native pthread attribute and
+// PthreadSetprio. The GPU command thread runs at NORMAL, i.e. below every high-class guest thread.
+//
+// KYTY_UFC_GPU_PRIORITY=1: on the console the graphics command processor is hardware; here it is a
+// thread, and a game may keep many job workers spinning. The guest band is shifted to
+// <= 478 -> 0 (NORMAL), 479..732 -> -1 (BELOW_NORMAL), >= 733 -> -2 (LOWEST), the GPU thread is
+// raised to +1 (ABOVE_NORMAL, see Common::RaiseThreadAboveGuest), and a guest thread whose affinity
+// mask has exactly one core when it starts runs one further step lower (floor -2). The priority is
+// applied with SetThreadPriority in RunThread, not only through the attribute.
+constexpr int GUEST_HOST_PRIORITY_HIGH   = 0;
+constexpr int GUEST_HOST_PRIORITY_NORMAL = -1;
+constexpr int GUEST_HOST_PRIORITY_LOW    = -2;
+
+static int GuestPriorityToHostDefault(int guest_priority) {
+	if (guest_priority <= 478) {
+		return +2;
+	}
+	if (guest_priority >= 733) {
+		return -2;
+	}
+	return 0;
+}
+
+static int GuestPriorityToHost(int guest_priority) {
+	if (!Common::UfcGpuPriorityEnabled()) {
+		return GuestPriorityToHostDefault(guest_priority);
+	}
+	if (guest_priority <= 478) {
+		return GUEST_HOST_PRIORITY_HIGH;
+	}
+	if (guest_priority >= 733) {
+		return GUEST_HOST_PRIORITY_LOW;
+	}
+	return GUEST_HOST_PRIORITY_NORMAL;
+}
+
+// A guest thread pinned to a single core owns that core on the console. A game that starts one
+// spinning job worker per core shares those cores with the threads that produce their work, on
+// fewer host cores and in the same band, and the spinners starve the producers. Decided once
+// when the thread starts: a main thread may pin itself to one core for a while and must not drop
+// with it.
+static bool LowerCoreBoundThread(KernelCpumask affinity) {
+	return Common::UfcGpuPriorityEnabled() && std::has_single_bit(affinity);
+}
+
+static int GuestThreadHostPriority(int guest_priority, bool core_bound) {
+	const int host = GuestPriorityToHost(guest_priority);
+	return core_bound ? std::max(host - 1, GUEST_HOST_PRIORITY_LOW) : host;
+}
+
+static int HostPriorityToGuest(int host_priority) {
+	if (host_priority <= GUEST_HOST_PRIORITY_LOW) {
+		return 767;
+	}
+	if (host_priority >= GUEST_HOST_PRIORITY_HIGH) {
+		return 256;
+	}
+	return 700;
+}
+
+#endif
 
 static constexpr KernelClockid KERNEL_CLOCK_REALTIME          = 0;
 static constexpr KernelClockid KERNEL_CLOCK_VIRTUAL           = 1;
@@ -396,6 +464,9 @@ struct PthreadPrivate {
 	std::atomic_bool      almost_done;
 	std::atomic_bool      free;
 	uint64_t              host_thread_id;
+	// KYTY_UFC_GPU_PRIORITY=1: pinned to one core when it started; runs one host priority step
+	// lower. Written by the thread itself, read by whoever changes its priority.
+	std::atomic_bool      core_bound = false;
 	uintptr_t             guest_host_rbx;
 	uintptr_t             guest_host_rsp;
 	uintptr_t             guest_host_rbp;
@@ -510,6 +581,49 @@ static void SchedulerBackoffOnce() {
 #else
 	std::this_thread::yield();
 #endif
+}
+
+// Waits on a waiter's condition variable until ready() or the deadline, dispatching pending signals.
+// Windows times condition-variable waits in whole milliseconds on the system tick, so a ~5 ms wait
+// woke up to ~1 ms late: the Bink sound thread, which paces its 5.33 ms grains with such waits,
+// fell to 0.93x real time and the intro videos' sound crackled (issue #5). The last 2.5 ms are
+// timed with the high-resolution timer in slices of at most 0.5 ms (a wake-up in that stretch is
+// seen within a slice) and a short yield loop.
+template <class Lock, class Ready>
+static void CondWaitUntil(Lock& lock, std::condition_variable& cv, const Ready& ready,
+                          std::chrono::steady_clock::time_point deadline) {
+	constexpr auto coarse_margin = std::chrono::microseconds(2500);
+	constexpr auto spin_margin   = std::chrono::microseconds(300);
+	constexpr auto fine_slice    = std::chrono::microseconds(500);
+	while (!ready()) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			break;
+		}
+		const auto remaining = deadline - now;
+		if (remaining > coarse_margin) {
+			cv.wait_for(lock, std::min<std::chrono::steady_clock::duration>(
+			                      remaining - coarse_margin,
+			                      std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		} else {
+			lock.unlock();
+			if (remaining > spin_margin) {
+				const auto slice = std::min<std::chrono::steady_clock::duration>(
+				    remaining - spin_margin, fine_slice);
+				Common::Thread::SleepMicro(static_cast<uint32_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(slice).count()));
+			} else {
+				std::this_thread::yield();
+			}
+			lock.lock();
+			continue;
+		}
+		if (!ready()) {
+			lock.unlock();
+			KernelDispatchPendingSignalForCurrentThread();
+			lock.lock();
+		}
+	}
 }
 
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
@@ -2147,13 +2261,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	KernelSchedParam pparam {};
-	if (param->sched_priority <= 478) {
-		pparam.sched_priority = +2;
-	} else if (param->sched_priority >= 733) {
-		pparam.sched_priority = -2;
-	} else {
-		pparam.sched_priority = 0;
-	}
+	pparam.sched_priority = GuestPriorityToHost(param->sched_priority);
 
 	if (pthread_attr_setschedparam(&attr_value->p, &pparam) != 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -2875,26 +2983,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	if (usec == 0) {
 		result = ETIMEDOUT;
 	} else {
-		while (!ready()) {
-			const auto now = std::chrono::steady_clock::now();
-			if (now >= deadline) {
-				break;
-			}
-
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			thread->cond_cv.wait_for(cond_lock, poll);
-
-			if (!ready()) {
-				cond_lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				cond_lock.lock();
-			}
-		}
-
+		CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 		result = (ready() ? OK : ETIMEDOUT);
 	}
 	CondRemoveWaiter(cond_value, thread);
@@ -2960,26 +3049,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
-	while (!ready()) {
-		const auto now = std::chrono::steady_clock::now();
-		if (now >= deadline) {
-			break;
-		}
-
-		const auto remaining = deadline - now;
-		const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-		                            ? remaining
-		                            : std::chrono::steady_clock::duration(
-		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-		thread->cond_cv.wait_for(cond_lock, poll);
-
-		if (!ready()) {
-			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
-			cond_lock.lock();
-		}
-	}
-
+	CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 	result = (ready() ? OK : ETIMEDOUT);
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
@@ -3139,6 +3209,16 @@ int PthreadGetPriorityForKernel(Pthread thread) {
 		return 700;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (Common::UfcGpuPriorityEnabled()) {
+		// The class of the priority the guest asked for, whatever host step the thread runs at.
+		if (thread->attr == nullptr) {
+			return 700;
+		}
+		return HostPriorityToGuest(GuestPriorityToHost(thread->attr->guest_priority));
+	}
+#endif
+
 	sched_param param {};
 	int         pol = 0;
 
@@ -3179,6 +3259,7 @@ static void CleanupThread(void* arg) {
 }
 
 static void* RunThread(void* arg) {
+	Common::OptOutThreadPowerThrottling();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!Common::HostException::InitializeThreadSignalStack()) {
@@ -3200,6 +3281,18 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (Common::UfcGpuPriorityEnabled()) {
+		// Apply the guest's priority to this thread directly: PthreadAttrSetinheritsched keeps
+		// inherit_sched out of the native attribute, so whether winpthreads honours the
+		// attribute's priority at creation is not ours to rely on.
+		thread->core_bound = LowerCoreBoundThread(thread->attr->affinity);
+		(void)SetThreadPriority(
+		    GetCurrentThread(),
+		    GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
+	}
+#endif
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
@@ -3485,13 +3578,7 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (prio <= 478) {
-		param.sched_priority = +2;
-	} else if (prio >= 733) {
-		param.sched_priority = -2;
-	} else {
-		param.sched_priority = 0;
-	}
+	param.sched_priority = GuestThreadHostPriority(prio, thread->core_bound);
 
 	if (pthread_setschedparam(thread->p, pol, &param) != 0) {
 		return KERNEL_ERROR_EINVAL;

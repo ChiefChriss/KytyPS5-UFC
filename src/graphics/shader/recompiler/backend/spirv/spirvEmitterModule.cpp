@@ -47,7 +47,7 @@ uint32_t TypeScalarU64(EmitterState& state) {
 
 uint32_t TypeU32Pair(EmitterState& state) {
 	if (state.u32_pair_type == 0) {
-		const auto element = TypeU32(state);
+		const auto element  = TypeU32(state);
 		state.u32_pair_type = state.builder.Type(spv::OpTypeStruct, element, element);
 	}
 	return state.u32_pair_type;
@@ -62,7 +62,7 @@ uint32_t TypeI32(EmitterState& state) {
 
 uint32_t TypeI32Pair(EmitterState& state) {
 	if (state.i32_pair_type == 0) {
-		const auto element = TypeI32(state);
+		const auto element  = TypeI32(state);
 		state.i32_pair_type = state.builder.Type(spv::OpTypeStruct, element, element);
 	}
 	return state.i32_pair_type;
@@ -216,7 +216,11 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 }
 
 void DefineDescriptors(EmitterState& state) {
-	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
+	const bool dynamic_clip = state.input_info.vertex != nullptr &&
+	                          state.input_info.vertex->clip_space.enabled &&
+	                          state.input_info.vertex->clip_space.dynamic;
+	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
+	    dynamic_clip || NanTrace::Active()) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -257,7 +261,8 @@ void DefineDescriptors(EmitterState& state) {
 					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
 					                            spv::DecorationCoherent);
 					if (state.storage_buffer_u64_variable != 0) {
-						state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
+						state.builder.AddAnnotation(spv::OpDecorate,
+						                            state.storage_buffer_u64_variable,
 						                            spv::DecorationCoherent);
 					}
 				}
@@ -544,10 +549,13 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
-	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
-		    return output.kind == IR::StageOutputKind::Position;
-	    })) {
+	if (state.program.stage == ShaderType::Vertex &&
+	    clip_distance_count + cull_distance_count < 8u &&
+	    std::ranges::any_of(
+	        state.outputs,
+	        [](const OutputBinding& output) {
+		        return output.kind == IR::StageOutputKind::Position;
+	        })) {
 		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
 		state.invalid_position_clip_distance = clip_distance_count++;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
@@ -667,7 +675,9 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(spv::CapabilityShader);
 	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
-	if (state.program.info.uses_dma) {
+	// The NaN tracer writes through a physical pointer in every shader.
+	const bool physical_addresses = state.program.info.uses_dma || NanTrace::Active();
+	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -726,7 +736,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma
+	state.builder.AddMemoryModel(physical_addresses
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);
@@ -748,12 +758,12 @@ void DefineModule(EmitterState& state) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 32u);
 	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
-		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t    local_z = 1u;
-		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
-		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
-		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+		uint32_t local_x = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t local_y = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t local_z = 1u;
+		local_x          = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
+		local_y          = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
+		local_z          = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
 		if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;

@@ -1286,14 +1286,13 @@ bool TileGetCmaskSize(uint32_t width, uint32_t height, uint32_t slices, uint32_t
 	return levels == 1 && TileGetColorMetadataSize(width, height, slices, 1024, 512, total_size);
 }
 
-void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
-                        uint32_t levels, Prospero::TileMode tile, TileSizeAlign* total_size,
-                        TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_IF(levels == 0 || levels > 16);
-
+// Returns false when the layout is unknown; outputs are then left untouched.
+static bool TileComputeTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
+                                   uint32_t levels, Prospero::TileMode tile,
+                                   TileSizeAlign* total_size, TileSizeOffset* level_sizes,
+                                   TilePaddedSize* padded_size, bool& linear) {
 	TileTextureElementLayout element {};
+	linear = false;
 	if (tile == Prospero::TileMode::kLinear && TileGetTextureElementLayout(format, element)) {
 		uint32_t mip_pitch[16] {};
 		uint32_t mip_height[16] {};
@@ -1324,7 +1323,8 @@ void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t 
 			total_size->align = 256;
 		}
 
-		return;
+		linear = true;
+		return true;
 	}
 
 	TileSurfaceLayout            layout {};
@@ -1332,11 +1332,66 @@ void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t 
 	    format, tile, TileSurfaceDimension::Dim2D, width, height, 1, levels, 1};
 	if (TileGetTiledTextureLayout(description, layout)) {
 		SetLegacyTiledMipLayout(layout, total_size, level_sizes, padded_size);
-		return;
+		return true;
 	}
-	if (total_size != nullptr && total_size->size == 0) {
-		EXIT("unknown format:\nformat = %u\nwidth  = %u\nheight = %u\nlevels = %u\ntile   = %u\n",
-		     static_cast<uint32_t>(format), width, height, levels, static_cast<uint32_t>(tile));
+	return false;
+}
+
+void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,
+                        uint32_t levels, Prospero::TileMode tile, TileSizeAlign* total_size,
+                        TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_IF(levels == 0 || levels > 16);
+
+	struct CachedTextureSize {
+		Prospero::BufferFormat format = {};
+		Prospero::TileMode     tile   = {};
+		uint32_t               width  = 0;
+		uint32_t               height = 0;
+		uint32_t               levels = 0;
+		bool                   linear = false;
+		TileSizeAlign          total_size {};
+		TileSizeOffset         level_sizes[16] {};
+		TilePaddedSize         padded_size[16] {};
+	};
+	static thread_local std::array<CachedTextureSize, 32> cache {};
+
+	const auto hash = (static_cast<uint32_t>(format) * 0x9e3779b1u) ^ (width * 0x85ebca6bu) ^
+	                  (height * 0xc2b2ae35u) ^ (levels << 8u) ^ static_cast<uint32_t>(tile);
+	auto& entry = cache[(hash ^ (hash >> 15u)) % cache.size()];
+	if (entry.levels != levels || entry.format != format || entry.tile != tile ||
+	    entry.width != width || entry.height != height) {
+		CachedTextureSize computed {format, tile, width, height, levels};
+		if (!TileComputeTextureSize(format, width, height, levels, tile, &computed.total_size,
+		                            computed.level_sizes, computed.padded_size, computed.linear)) {
+			if (total_size != nullptr && total_size->size == 0) {
+				EXIT("unknown format:\nformat = %u\nwidth  = %u\nheight = %u\nlevels = %u\n"
+				     "tile   = %u\n",
+				     static_cast<uint32_t>(format), width, height, levels,
+				     static_cast<uint32_t>(tile));
+			}
+			return;
+		}
+		entry = computed;
+	}
+
+	if (total_size != nullptr) {
+		*total_size = entry.total_size;
+	}
+	for (uint32_t level = 0; level < levels; level++) {
+		if (level_sizes != nullptr) {
+			// The linear layout only defines size and offset; other fields keep caller values.
+			if (entry.linear) {
+				level_sizes[level].size   = entry.level_sizes[level].size;
+				level_sizes[level].offset = entry.level_sizes[level].offset;
+			} else {
+				level_sizes[level] = entry.level_sizes[level];
+			}
+		}
+		if (padded_size != nullptr) {
+			padded_size[level] = entry.padded_size[level];
+		}
 	}
 }
 

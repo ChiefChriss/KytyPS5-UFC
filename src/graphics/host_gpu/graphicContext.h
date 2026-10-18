@@ -18,6 +18,28 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+// Opt-in native-image backing pool (KYTY_UFC_IMAGE_POOL): a freed VulkanImage keeps its
+// VkImage+VmaAllocation so the next image request with identical create parameters recycles the
+// driver object instead of paying vkCreateImage/vmaDestroyImage again. The acquiring caller
+// (textureCache) refreshes/renders the new guest range exactly as for a fresh image; the recycled
+// content is unreferenced because the layout is reset to the request's initialLayout (undefined).
+struct PooledNativeImage {
+	vk::Image           image      = nullptr;
+	VmaAllocation       allocation = nullptr;
+	vk::Format          format     = vk::Format::eUndefined;
+	vk::ImageType       image_type = vk::ImageType::e2D;
+	vk::Extent3D        extent     = {1, 1, 1};
+	uint32_t            layers     = 1;
+	uint32_t            mip_levels = 1;
+	uint32_t            samples    = 1;
+	vk::ImageUsageFlags usage      = {};
+	vk::ImageCreateFlags flags     = {};
+	vk::ImageTiling     tiling     = vk::ImageTiling::eOptimal;
+	vk::SharingMode     sharing    = vk::SharingMode::eExclusive;
+	vk::ImageLayout     initial_layout = vk::ImageLayout::eUndefined;
+	uint64_t            bytes      = 0;
+};
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
@@ -32,6 +54,8 @@ struct GraphicContext {
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
+	// VK_EXT_conditional_rendering: GPU-side render-target metadata clear evaluation.
+	bool                               conditional_rendering_enabled         = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                               checkpoints_enabled                   = false;
@@ -108,6 +132,11 @@ struct GraphicContext {
 	uint32_t screen_height = 0;
 
 private:
+	// Opt-in native-image backing pool (KYTY_UFC_IMAGE_POOL). Only CreateImage/DeleteImage touch
+	// it, on the caller (GPU command) thread. Default OFF.
+	[[nodiscard]] bool TryReusePooledImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	void               EvictOnePooledImage();
+
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;
@@ -115,6 +144,8 @@ private:
 	                            vk::ImageCreateFlags>,
 	                 std::pair<vk::Result, vk::ImageFormatProperties>>
 	    m_image_format_properties;
+	std::vector<PooledNativeImage> m_image_pool;
+	uint64_t                       m_image_pool_bytes = 0;
 };
 
 struct VulkanImageState {

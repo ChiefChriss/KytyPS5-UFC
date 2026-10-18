@@ -1,17 +1,29 @@
 param(
     [string]$BuildDir = "_Build/windows",
-    [string]$QtDir = "C:/Qt/6.10.3/msvc2022_64",
-    [string]$VsDir = "C:\Program Files\Microsoft Visual Studio\2022\Community",
+    [string]$QtDir = $(if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'transfer-settings.json')) { (Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'transfer-settings.json') -Raw | ConvertFrom-Json).QtDir } else { 'C:/Qt/6.10.3/msvc2022_64' }),
+    [string]$VsDir = $(if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'transfer-settings.json')) { (Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'transfer-settings.json') -Raw | ConvertFrom-Json).VsDir } else { 'C:\Program Files\Microsoft Visual Studio\2022\Community' }),
     [switch]$Fresh,
     [switch]$SkipTests
 )
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
+function Assert-GameClosed {
+    $busy = Get-Process -Name launcher, kyty_emulator -ErrorAction SilentlyContinue
+    if ($busy) { throw 'Launcher/emulator is active. Close only your own processes, then retry the build/install/tests.' }
+}
+Assert-GameClosed
+
 $vcvars = Join-Path $VsDir 'VC\Auxiliary\Build\vcvars64.bat'
 if (-not (Test-Path -LiteralPath $vcvars)) { throw "vcvars64.bat not found: $vcvars" }
 cmd /c "`"$vcvars`" >nul && set" | ForEach-Object {
     if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
+}
+
+# Build Tools installs put clang-cl under VC\Tools\Llvm without adding it to PATH.
+if (-not (Get-Command clang-cl -ErrorAction SilentlyContinue)) {
+    $llvmBin = Join-Path $VsDir 'VC\Tools\Llvm\x64\bin'
+    if (Test-Path -LiteralPath (Join-Path $llvmBin 'clang-cl.exe')) { $env:PATH = "$llvmBin;$env:PATH" }
 }
 
 if (-not $env:VULKAN_SDK) {
@@ -43,6 +55,11 @@ Write-Host "Building $iterationLabel"
 try {
     $configure = @('-S', '.', '-B', $BuildDir, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
         '-DCMAKE_C_COMPILER=clang-cl', '-DCMAKE_CXX_COMPILER=clang-cl', "-DCMAKE_PREFIX_PATH=$QtDir")
+    # ThinLTO for the emulator target (Dev 093+); KYTY_BUILD_IPO=0 builds without it.
+    $ipo = if ($env:KYTY_BUILD_IPO -eq '0') { 'OFF' } else { 'ON' }
+    $configure += "-DKYTY_EMULATOR_IPO=$ipo"
+    $lldLink = Join-Path $VsDir 'VC\Tools\Llvm\x64\bin\lld-link.exe'
+    if (Test-Path -LiteralPath $lldLink) { $configure += "-DCMAKE_LINKER=$lldLink" }
     if ($Fresh) { $configure = @('--fresh') + $configure }
     cmake @configure
     if ($LASTEXITCODE) { throw "configure failed" }
@@ -51,10 +68,10 @@ try {
     if ($LASTEXITCODE) { throw "launcher build failed" }
     # A crashed emulator or antivirus scan can briefly lock the installed executables.
     for ($attempt = 1; $attempt -le 5; $attempt++) {
+        Assert-GameClosed
         cmake --install $BuildDir --prefix "$BuildDir/install"
         if (-not $LASTEXITCODE) { break }
         if ($attempt -eq 5) { throw "install failed" }
-        Get-Process kyty_emulator -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 3
     }
 } catch {
@@ -63,8 +80,10 @@ try {
 }
 
 if (-not $SkipTests) {
+    Assert-GameClosed
     cmake --build $BuildDir --target kyty_tests
     if ($LASTEXITCODE) { throw "test build failed" }
+    Assert-GameClosed
     ctest --test-dir $BuildDir --output-on-failure
     if ($LASTEXITCODE) { throw "tests failed" }
 }

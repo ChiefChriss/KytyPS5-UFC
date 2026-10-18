@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -29,7 +30,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -126,6 +129,42 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
+// A proven uniform-fill dispatch (single store, every element of the descriptor written with one
+// value) over render-target color metadata is the same guest write as a PM4 DMA fill. Route it
+// through the buffer cache like DmaData. Clean metadata is filled in guest memory; GPU-owned
+// whole pages are filled on the GPU timeline and the same bytes are published to guest memory.
+// Either way the next render-target discovery decodes the clear code without draining the GPU.
+// Opt-in (KYTY_UFC_FILL_CONVERT=1): user bisection tied UFC fighter-mesh corruption, guest
+// crashes and device loss to this conversion or the GPU DCC evaluator, so the dispatch runs as
+// recorded by default.
+static bool TryConsumeColorMetadataFill(CommandBuffer& command, uint64_t address, uint64_t size,
+                                        uint32_t value) {
+	static const bool enabled = [] {
+		const char* setting = std::getenv("KYTY_UFC_FILL_CONVERT"); // Dev 094 all-on bisect: on by default, =0 turns it off
+		return setting == nullptr || std::strcmp(setting, "0") != 0;
+	}();
+	constexpr uint64_t MaxConvertedFill = 4ull * 1024 * 1024;
+	if (!enabled || ((address | size) & 3u) != 0 || size == 0 || size > MaxConvertedFill) {
+		WaitStats::NoteFillConversion(3);
+		return false;
+	}
+	auto& context = command.GetContext();
+	if (!context.GetTextureCache().OverlapsColorMetadata(address, size)) {
+		WaitStats::NoteFillConversion(2);
+		return false;
+	}
+	auto& buffer_cache = context.GetBufferCache();
+	WaitStats::NoteFillConversion(buffer_cache.IsRegionGpuModified(address, size) ? 1u : 0u);
+	buffer_cache.FillBufferCoherent(address, size, value);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("GraphicsRenderDispatchDirect: color-metadata fill addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
+		     address, size, value);
+	}
+	return true;
+}
+
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
                                                  CommandBuffer& command, uint32_t group_x,
                                                  uint32_t group_y, uint32_t group_z,
@@ -187,8 +226,9 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	                              size)) {
 		return false;
 	}
+	command.GetContext().GetBufferCache().NoteUniformFillDispatch(descriptor.Base48(), size);
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		return false;
+		return TryConsumeColorMetadataFill(command, descriptor.Base48(), size, packed_clear);
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
@@ -258,8 +298,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions      = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	const auto compute_program = [&] {
+		// Load-window attribution (Dev 117): split the 9.3 s CpOpDispatchDirect zone.
+		KYTY_PROFILER_BLOCK("CS::GetProgram", profiler::colors::CyanA700);
+		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	}();
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0] = thread_group_x;
 		input_info.dispatch_threads_num[1] = thread_group_y;
@@ -268,10 +311,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (resources.specialization_reads.empty() &&
-	    (TryConsumeComputeMetaClear(input_info, buffer) ||
-	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                 thread_group_z, mode))) {
+	bool consumed_clear   = false;
+	if (resources.specialization_reads.empty()) {
+		KYTY_PROFILER_BLOCK("CS::FillChecks", profiler::colors::Amber300);
+		consumed_clear = TryConsumeComputeMetaClear(input_info, buffer) ||
+		                 TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
+		                                             thread_group_y, thread_group_z, mode);
+	}
+	if (consumed_clear) {
 		ResetBindings();
 		return;
 	}
@@ -366,15 +413,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
-	PrepareBindings(input_info.stage, bindings);
-	FindBuffers(bindings);
+	{
+		KYTY_PROFILER_BLOCK("CS::PrepareBindings", profiler::colors::Blue300);
+		PrepareBindings(input_info.stage, bindings);
+		FindBuffers(bindings);
+	}
 	if (program.info.uses_dma) {
+		KYTY_PROFILER_BLOCK("CS::PrepareBda", profiler::colors::DeepOrangeA200);
 		m_context.PrepareBda();
 	}
-	RebindImages(bindings);
-	RebindBuffers(bindings);
+	{
+		KYTY_PROFILER_BLOCK("CS::Rebind", profiler::colors::Green200);
+		RebindImages(bindings);
+		RebindBuffers(bindings);
+	}
 
-	auto              vk_buffer        = buffer.Handle();
+	auto              vk_buffer        = buffer.Recorder();
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -395,8 +449,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	{
+		KYTY_PROFILER_BLOCK("CS::PostBarrier", profiler::colors::Green300);
+		// The removed host fence also ordered read-only dispatches before later writers.
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		m_context.GetBufferCache().RecordPendingArgsCopies();
+	}
 	ResetBindings();
 }
 
@@ -414,30 +472,44 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	const auto             compute_program = m_context.GetPipelineCache().GetComputeProgram(
-        cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	const auto compute_program = [&] {
+		KYTY_PROFILER_BLOCK("CS::GetProgram", profiler::colors::CyanA700);
+		return m_context.GetPipelineCache().GetComputeProgram(
+		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	}();
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
-	PrepareBindings(input_info.stage, bindings);
-	FindBuffers(bindings);
+	{
+		KYTY_PROFILER_BLOCK("CS::PrepareBindings", profiler::colors::Blue300);
+		PrepareBindings(input_info.stage, bindings);
+		FindBuffers(bindings);
+	}
 	const auto& program = *input_info.stage.program;
 	if (buffer.GetGraphics().checkpoints_enabled || buffer.GetGraphics().buffer_markers_enabled) {
 		GpuCrashDiagnostics::AnnotateLastCheckpoint(program.shader_hash);
 	}
 	if (program.info.uses_dma) {
+		KYTY_PROFILER_BLOCK("CS::PrepareBda", profiler::colors::DeepOrangeA200);
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
-	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+	Buffer*    args_buffer = nullptr;
+	uint64_t   args_offset = 0;
+	{
+		KYTY_PROFILER_BLOCK("CS::ObtainArgs", profiler::colors::Amber300);
+		const auto obtained = m_context.GetBufferCache().ObtainBuffer(
+		    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+		args_buffer = obtained.first;
+		args_offset = obtained.second;
+	}
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const auto vk_buffer = buffer.Handle();
+	const auto vk_buffer = buffer.Recorder();
 	const bool has_storage_writes =
 	    HasShaderBufferWrites(input_info.stage) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -465,6 +537,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	m_context.GetBufferCache().RecordPendingArgsCopies();
 	ResetBindings();
 }
 

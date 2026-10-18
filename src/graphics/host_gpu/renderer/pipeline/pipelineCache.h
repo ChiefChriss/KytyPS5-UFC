@@ -96,6 +96,9 @@ struct PipelineVertexInputState {
 	bool operator==(const PipelineVertexInputState&) const = default;
 };
 
+// Shader/pipeline build cost accounting (printed with the "Shaders:" line).
+void NotePipelineBuildNs(uint64_t nanoseconds) noexcept;
+
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;

@@ -1,6 +1,9 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/renderer/gpuCheckpointHistory.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/NanTrace.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -9,13 +12,19 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstring>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -3363,6 +3372,27 @@ void TestGraphicsPushConstantLayout() {
   AllocateBindings(repeated_spill.program, 20);
   Check(repeated_spill.program.bindings == spill_layout,
         "storage fallback retained an irrelevant attempted push-data position");
+
+  // The optional event token must not overwrite guest data, including a stage that
+  // otherwise exactly fits the 128-byte bank. Clip/mesh headers keep their offsets.
+  Fixture traced_edge(ShaderType::Pixel);
+  AddUserData(traced_edge, 32);
+  AllocateBindings(traced_edge.program, 0, Libs::Graphics::ShaderRecompiler::NanTrace::EventPushDword);
+  Check(!traced_edge.program.bindings.UsesPushData() &&
+            FindBinding(traced_edge.program.bindings, DescriptorBindingKind::ShaderData) != nullptr,
+        "traced full bank overlapped the event token instead of using storage");
+  Fixture traced_tail(ShaderType::Pixel);
+  AddUserData(traced_tail, 21);
+  AllocateBindings(traced_tail.program, PushData::MeshDrawDwordCount + PushData::ClipTransformDwordCount,
+                   Libs::Graphics::ShaderRecompiler::NanTrace::EventPushDword);
+  Check(traced_tail.program.bindings.UsesPushData() &&
+            traced_tail.program.bindings.push_data_start_dword == 10,
+        "diagnostic reservation moved the mesh/viewport headers or rejected a valid tail");
+  Fixture traced_spill(ShaderType::Pixel);
+  AddUserData(traced_spill, 22);
+  AllocateBindings(traced_spill.program, 10, Libs::Graphics::ShaderRecompiler::NanTrace::EventPushDword);
+  Check(!traced_spill.program.bindings.UsesPushData(),
+        "diagnostic reservation allowed a later stage to overwrite the token");
 }
 
 void TestResourceLimitIsTransactional() {
@@ -3446,6 +3476,333 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+void TestGraphicsCheckpointHistory() {
+  using namespace Libs::Graphics::GpuCrashDiagnostics;
+  CheckpointHistory<4> history;
+  CheckpointInfo info;
+  info.submit_id = 77;
+  info.graphics.count = 4;
+  for (uint32_t i = 0; i < 4; ++i) {
+    info.graphics.stages[i] = {0x12340000u + i, 10u + i, i + 1u, i == 3 ? 32u : 64u};
+  }
+  const auto expected = info.graphics;
+  // Every graphics execution phase gets the same prepared program identities.
+  for (uint64_t sequence = 1; sequence <= 4; ++sequence) {
+    info.args[0] = static_cast<uint32_t>(sequence * 0x100);
+    history.Publish(sequence, info);
+  }
+  info.graphics = {}; // Future preparations cannot mutate published identities.
+  for (uint64_t sequence = 1; sequence <= 4; ++sequence) {
+    const auto snapshot = history.Read(sequence);
+    Check(snapshot && snapshot->graphics == expected && snapshot->submit_id == 77 &&
+              snapshot->args[0] == sequence * 0x100,
+          "graphics checkpoint lost owned stage identities or phase");
+    Check(!history.AnnotateCompute(sequence, 0xdead),
+          "compute annotation corrupted a graphics checkpoint");
+  }
+  const auto owned = *history.Read(1);
+  history.Publish(5, info); // Same slot; unprepared/non-draw info must be empty.
+  Check(!history.Read(1) && !history.AnnotateCompute(1, 0xbeef),
+        "expired checkpoint was read or annotated after ring wrap");
+  Check(history.Read(5)->graphics.count == 0 && history.Read(5)->graphics.stages[0].hash == 0,
+        "new unprepared checkpoint inherited previous draw shaders");
+  Check(owned.graphics == expected, "owned report changed after ring reuse");
+  Check(history.AnnotateCompute(5, 0xabc) && history.Read(5)->shader_hash == 0xabc,
+        "legacy compute shader annotation was lost");
+  Check(!history.Read(0) && !history.AnnotateCompute(0, 1), "zero checkpoint token accepted");
+
+  // A reporter copying a reused slot must see a complete record or expiration,
+  // never a payload torn between preparations. Exercise the actual production ring.
+  std::atomic<uint64_t> latest {0};
+  std::atomic<bool> finished {false};
+  std::atomic<bool> coherent {true};
+  std::thread writer([&] {
+    for (uint64_t seq = 6; seq <= 50000; ++seq) {
+      CheckpointInfo value;
+      value.submit_id = seq;
+      value.graphics.count = 2;
+      value.graphics.stages[0] = {seq, seq + 1, 1, 64};
+      value.graphics.stages[1] = {seq + 2, seq + 3, 2, 32};
+      history.Publish(seq, value);
+      latest.store(seq, std::memory_order_release);
+    }
+    finished.store(true, std::memory_order_release);
+  });
+  do {
+    const auto seq = latest.load(std::memory_order_acquire);
+    if (const auto snapshot = history.Read(seq)) {
+      if (snapshot->submit_id != seq || snapshot->graphics.count != 2 ||
+          snapshot->graphics.stages[0].hash != seq ||
+          snapshot->graphics.stages[0].program_id != seq + 1 ||
+          snapshot->graphics.stages[1].hash != seq + 2 ||
+          snapshot->graphics.stages[1].program_id != seq + 3) {
+        coherent.store(false);
+      }
+    }
+  } while (!finished.load(std::memory_order_acquire));
+  writer.join();
+  Check(coherent.load(), "concurrent checkpoint publication exposed torn metadata");
+}
+
+void TestHighFanoutIdentityAndUseReplacement() {
+  Fixture fixture;
+  const auto root = fixture.Emit(ValueOpcode::IAdd32, {Value(1u), Value(2u)});
+  std::vector<Inst *> consumers;
+  constexpr size_t Count = 4096;
+  consumers.reserve(Count);
+  for (size_t i = 0; i < Count; ++i) {
+    const auto identity = fixture.Emit(ValueOpcode::Identity, {root});
+    const auto nested = fixture.Emit(ValueOpcode::Identity, {identity});
+    consumers.push_back(fixture.Emit(ValueOpcode::IAdd32, {nested, nested}).Instruction());
+  }
+  // A retained planning expression is a consumer outside the translated block list.
+  fixture.program.value_storage.emplace_back(ValueOpcode::IAdd32);
+  auto &retained = fixture.program.value_storage.back();
+  retained.SetArg(0, root);
+  retained.SetArg(1, Value(3u));
+  RemoveIdentities(fixture.program.blocks);
+  Check(root.Instruction()->UseCount() == Count * 2 + 1,
+        "batched identity removal lost or duplicated reverse uses");
+  for (const auto *consumer : consumers) {
+    Check(consumer->Arg(0) == root && consumer->Arg(1) == root,
+          "nested high-fanout identities left a stale consumer operand");
+  }
+  root.Instruction()->ReplaceUsesWith(Value(7u), false);
+  for (const auto *consumer : consumers) {
+    Check(consumer->Arg(0) == Value(7u) && consumer->Arg(1) == Value(7u),
+          "bulk use replacement did not rewrite both operands");
+  }
+  Check(retained.Arg(0) == Value(7u) && retained.Arg(1) == Value(3u),
+        "bulk replacement lost a retained resource-plan consumer");
+  Check(root.Instruction()->UseCount() == 0 && root.Instruction()->NumArgs() == 0,
+        "removed definition retained stale reverse uses or operands");
+}
+
+ResourcePlan BuildNativeComparisonPlan() {
+  Fixture fixture;
+  fixture.program.srt_plan_complete = true;
+  fixture.program.resource_tracking_complete = true;
+  std::array<Value, 12> s;
+  for (uint32_t i = 0; i < s.size(); ++i)
+    s[i] = fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(i))});
+  const auto add = [&](Value value) {
+    DescriptorSource source;
+    source.dword_count = 1;
+    source.dwords[0] = value;
+    fixture.program.descriptor_sources.push_back(source);
+  };
+  for (const auto opcode : {ValueOpcode::IAdd32, ValueOpcode::ISub32, ValueOpcode::IMul32,
+                           ValueOpcode::UMin32, ValueOpcode::BitwiseAnd32,
+                           ValueOpcode::BitwiseOr32, ValueOpcode::BitwiseXor32,
+                           ValueOpcode::ShiftLeftLogical32, ValueOpcode::ShiftRightLogical32,
+                           ValueOpcode::ShiftRightArithmetic32, ValueOpcode::IEqual32,
+                           ValueOpcode::INotEqual32, ValueOpcode::ULessThan32,
+                           ValueOpcode::UGreaterThan32, ValueOpcode::SGreaterThanEqual32})
+    add(fixture.Emit(opcode, {s[0], s[1]}));
+  const auto wide0 = fixture.Emit(ValueOpcode::CompositeConstructU64, {s[0], s[1]});
+  const auto wide1 = fixture.Emit(ValueOpcode::CompositeConstructU64, {s[2], s[3]});
+  for (const auto opcode : {ValueOpcode::IAdd64, ValueOpcode::ISub64, ValueOpcode::IMul64,
+                           ValueOpcode::BitwiseAnd64, ValueOpcode::ShiftLeftLogical64,
+                           ValueOpcode::ShiftRightLogical64, ValueOpcode::ShiftRightArithmetic64}) {
+    const auto value = fixture.Emit(opcode, {wide0, wide1});
+    add(fixture.Emit(ValueOpcode::CompositeExtractU64, {value, Value(0u)}));
+    add(fixture.Emit(ValueOpcode::CompositeExtractU64, {value, Value(1u)}));
+  }
+  for (const auto opcode : {ValueOpcode::ConvertF32U32, ValueOpcode::ConvertU32F32,
+                           ValueOpcode::FPTrunc32, ValueOpcode::FPIsNan32,
+                           ValueOpcode::BitwiseNot32}) add(fixture.Emit(opcode, {s[2]}));
+  add(fixture.Emit(ValueOpcode::FPMul32, {s[2], s[3]}));
+  for (const auto opcode : {ValueOpcode::FPOrdLessThanEqual32, ValueOpcode::FPOrdGreaterThanEqual32}) {
+    add(fixture.Emit(opcode, {s[2], s[3]}));
+    add(fixture.Emit(opcode, {s[2], s[3]}, FPCompareFlags{.flush_input_denorms = true}));
+  }
+  add(fixture.Emit(ValueOpcode::BitFieldUExtract, {s[0], s[4], s[5]}));
+  add(fixture.Emit(ValueOpcode::BitFieldSExtract, {s[0], s[4], s[5]}));
+  add(fixture.Emit(ValueOpcode::BitFieldInsert, {s[0], s[1], s[6], s[7]}));
+  const auto condition = fixture.Emit(ValueOpcode::ULessThan32, {s[0], s[1]});
+  add(fixture.Emit(ValueOpcode::SelectU32, {condition, s[2], s[3]}));
+  const auto missing = fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(99))});
+  add(fixture.Emit(ValueOpcode::SelectU32, {condition, s[0], missing}));
+  for (const auto opcode : {ValueOpcode::LogicalAnd, ValueOpcode::LogicalOr, ValueOpcode::LogicalXor}) {
+    add(fixture.Emit(opcode, {condition, missing}));
+    add(fixture.Emit(opcode, {missing, condition}));
+  }
+  add(fixture.Emit(ValueOpcode::LogicalNot, {condition}));
+  fixture.program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  const auto address = fixture.Emit(ValueOpcode::GetAddressResource, {Value(0x10000u), Value(0u)});
+  const auto raw = fixture.Emit(ValueOpcode::LoadAddressU32,
+                               {address, s[10], Value(0u), Value(true)},
+                               MemoryFlags{.index = 0, .pc = 0x40});
+  add(raw);
+  add(fixture.Emit(ValueOpcode::SelectU32, {condition, raw, s[0]}));
+  fixture.program.srt_reads.push_back({raw, 0});
+  const auto srt = fixture.Emit(ValueOpcode::GetSrtResource);
+  add(fixture.Emit(ValueOpcode::ReadConst, {srt, Value(0u)}));
+  auto plan = ExtractResourcePlan(fixture.program);
+  plan.clean_flat_slots.assign(plan.srt_reads.size(), 1);
+  return plan;
+}
+
+void TestNativeSrtMatchesInterpreterAndReadMask() {
+  const auto reference = BuildNativeComparisonPlan();
+  reference.native_attempted = true;
+  const auto native = BuildNativeComparisonPlan();
+  native.native_code = SrtNativeCode::Compile(native);
+  Check(native.native_code != nullptr && native.native_code->CodeSize() > 0,
+        "native resource plan did not generate executable routines");
+  constexpr uint32_t specials[] = {0, 1, 31, 32, 33, 0x7fffffff, 0x80000000, 0xffffffff,
+                                  0x3f800000, 0xbf800000, 0x7f800000, 0xff800000,
+                                  0x7fc00000, 0x00400000, 0x80400000, 0x4f800000,
+                                  0x4f7fffff, 0x00800000};
+  struct Reads { uint32_t ordinary = 0, clean = 0; };
+  const auto ordinary_reader = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    ++static_cast<Reads *>(data)->ordinary;
+    if (address < 0x10000 || address >= 0x10100 || (address & 3) || words.size() != 1) return false;
+    words[0] = 0x11110000u + static_cast<uint32_t>(address - 0x10000);
+    return true;
+  };
+  const auto clean_reader = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    ++static_cast<Reads *>(data)->clean;
+    if (address < 0x10000 || address >= 0x10100 || (address & 3) || words.size() != 1) return false;
+    words[0] = 0x22220000u + static_cast<uint32_t>(address - 0x10000);
+    return true;
+  };
+  std::mt19937 random(19);
+  for (bool split : {false, true}) {
+    for (uint32_t trial = 0; trial < 4000; ++trial) {
+      std::array<uint32_t, 12> user;
+      for (auto &word : user) word = (random() & 1) ? specials[random() % std::size(specials)] : random();
+      for (uint32_t i = 4; i < 8; ++i) user[i] = random() % 40;
+      user[10] = (random() % 80) * 4;
+      for (uint32_t source = 0; source < reference.descriptor_sources.size(); ++source) {
+        uint64_t expected_mask = 0, actual_mask = 0;
+        Reads expected_reads, actual_reads;
+        SrtRuntime ref_runtime{.user_data = user, .read_memory = ordinary_reader, .userdata = &expected_reads,
+                               .read_specialization_memory = clean_reader, .user_data_reads = &expected_mask};
+        SrtRuntime nat_runtime{.user_data = user, .read_memory = ordinary_reader, .userdata = &actual_reads,
+                               .read_specialization_memory = clean_reader, .user_data_reads = &actual_mask};
+        DescriptorValue expected, actual;
+        bool expected_ok, actual_ok;
+        if (split) {
+          SrtWalker ref_clean(reference, CleanRuntime(ref_runtime));
+          SrtWalker ref(reference, ref_runtime, reference.clean_flat_slots, &ref_clean);
+          expected_ok = ref.EvaluateDescriptor(source, expected);
+          SrtWalker nat_clean(native, CleanRuntime(nat_runtime));
+          SrtWalker nat(native, nat_runtime, native.clean_flat_slots, &nat_clean);
+          actual_ok = nat.EvaluateDescriptor(source, actual);
+        } else {
+          SrtWalker ref(reference, ref_runtime);
+          expected_ok = ref.EvaluateDescriptor(source, expected);
+          SrtWalker nat(native, nat_runtime);
+          actual_ok = nat.EvaluateDescriptor(source, actual);
+        }
+        Check(expected_ok == actual_ok && (!expected_ok || expected.dwords == actual.dwords),
+              "native SRT arithmetic/failure differs from the interpreter");
+        Check(expected_mask == actual_mask && expected_reads.ordinary == actual_reads.ordinary &&
+                  expected_reads.clean == actual_reads.clean,
+              "native SRT changed lazy reads, SGPR mask, or clean-reader routing");
+      }
+    }
+  }
+}
+
+void TestShaderDiskCacheRoundtripAndReopen() {
+  namespace Cache = Libs::Graphics::ShaderDiskCache;
+  const auto source = BuildNativeComparisonPlan();
+  source.native_code = SrtNativeCode::Compile(source);
+  Cache::Bytes payload, reencoded;
+  Check(Cache::EncodeSource(source, payload), "closed resource graph could not be encoded");
+  ResourcePlan decoded;
+  Check(Cache::DecodeSource(payload, decoded) && !decoded.native_code &&
+            decoded.evaluation_contexts.empty() && decoded.evaluation_value_count == 0 &&
+            Cache::EncodeSource(decoded, reencoded) && payload == reencoded,
+        "resource graph roundtrip changed fields or persisted process-local JIT/evaluation scratch");
+  std::array<uint32_t, 12> user{2, 3, 0x3f800000, 0x40000000, 4, 8, 1, 16, 0, 0, 0, 0};
+  const auto reader = +[](void *, uint64_t address, std::span<uint32_t> words) {
+    if (address != 0x10000 || words.size() != 1) return false;
+    words[0] = 0xabcdef12;
+    return true;
+  };
+  SrtRuntime runtime{.user_data = user, .read_memory = reader, .read_specialization_memory = reader};
+  for (uint32_t i = 0; i < source.descriptor_sources.size(); ++i) {
+    SrtWalker expected(source, runtime), actual(decoded, runtime);
+    DescriptorValue a, b;
+    const auto ok = expected.EvaluateDescriptor(i, a);
+    Check(ok == actual.EvaluateDescriptor(i, b) && (!ok || a == b),
+          "decoded resource graph does not evaluate like the original graph");
+  }
+  ResourcePlan untouched;
+  untouched.shader_hash = 0x12345678;
+  Check(!Cache::DecodeSource(std::span(payload).first(payload.size() - 1), untouched) &&
+            untouched.shader_hash == 0x12345678,
+        "truncated source cache was accepted or partly replaced its destination");
+  ResourcePlan open;
+  Inst external(ValueOpcode::IAdd32);
+  external.SetArg(0, Value(1u)); external.SetArg(1, Value(2u));
+  open.srt_reads.push_back({Value(&external), 0});
+  Check(!Cache::EncodeSource(open, reencoded), "cache serialized a reference outside its owning resource graph");
+
+  CompiledShaderInfo program;
+  program.stage = ShaderType::Compute; program.shader_hash = 0x76543210; program.wave_size = 32;
+  program.user_data_base = 8; program.user_data_count = 12; program.scratch_dwords = 17;
+  program.param_export_mask = 0x1234; program.has_address_writes = true;
+  program.info.buffers.push_back({.source = 3, .first_use_pc = 0x40, .max_byte_extent = 256,
+                                 .packed_stride = 16, .read = true, .written = true});
+  program.info.images.push_back({.source = 4, .first_use_pc = 0x80,
+      .resource_class = ImageResourceClass::Sampled, .dimension = Decoder::ImageDimension::Dim2D,
+      .mip_mode = ImageMipMode::Dynamic, .mip_count = 3, .read = true,
+      .indirect_mapping_offset = 11, .indirect_search_iterations = 7, .indirect_resources = {1, 2}});
+  program.info.samplers.push_back({.source = 5, .snapshot_index = 0, .force_point_filtering = true,
+                                   .integer_border = true, .gather_lod = true});
+  program.info.sampled_pairs.push_back({0, 0, 0x80});
+  program.info.inputs.push_back({.kind = StageInputKind::GlobalInvocationId, .location = 2,
+                                 .component_count = 3, .debug_name = "cached input", .per_vertex = true});
+  program.info.outputs.push_back({.kind = StageOutputKind::Mrt, .index = 2,
+                                  .location = 3, .debug_name = "cached output"});
+  program.info.vertex_fetch_components[7] = 3; program.info.vertex_offset_sgpr = 9;
+  program.info.instance_offset_sgpr = 10; program.info.has_bitwise_xor = true; program.info.uses_dma = true;
+  program.bindings.push_data_start_dword = 4; program.bindings.memory_offset_dword = 2;
+  program.bindings.memory_offset_count = 4; program.bindings.user_data_registers = {8, 9};
+  program.bindings.descriptors.push_back({DescriptorBindingKind::Buffers, {0}});
+  const std::vector<uint32_t> spirv{0x07230203u, 0x00010300u, 0, 1, 0};
+  Cache::Bytes permutation;
+  std::vector<uint32_t> restored;
+  CompiledShaderInfo compiled;
+  Check(Cache::EncodePermutation(spirv, program, permutation) &&
+            Cache::DecodePermutation(permutation, restored, compiled) && restored == spirv &&
+            compiled.stage == program.stage && compiled.shader_hash == program.shader_hash &&
+            compiled.wave_size == 32 && compiled.user_data_base == 8 && compiled.user_data_count == 12 &&
+            compiled.scratch_dwords == 17 && compiled.param_export_mask == 0x1234 && compiled.has_address_writes &&
+            compiled.info == program.info && compiled.bindings == program.bindings,
+        "compiled program roundtrip lost resource metadata, binding ABI, or shader words");
+  Check(!Cache::DecodePermutation(std::span(permutation).first(permutation.size() - 1), restored, compiled),
+        "truncated compiled cache was accepted");
+
+  const auto parent = std::filesystem::path("_ShaderCacheCodecTest");
+  std::filesystem::create_directories(parent);
+  const auto directory = parent / std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  Check(std::filesystem::create_directory(directory), "could not create an isolated cache test directory");
+  struct Cleanup { std::filesystem::path path; ~Cleanup() { std::error_code error; std::filesystem::remove_all(path, error); } } cleanup{directory};
+  const Cache::Bytes key{1, 2, 3, 4}, another_key{1, 2, 3, 5};
+  {
+    Cache::Store store(directory);
+    store.Save(key, permutation);
+    store.Flush();
+  }
+  {
+    Cache::Store store(directory);
+    Cache::Bytes loaded;
+    Check(store.Load(key, loaded) && loaded == permutation && !store.Load(another_key, loaded),
+          "new cache session did not reuse the exact key/payload or accepted another key");
+    const auto file = std::filesystem::directory_iterator(directory)->path();
+    std::fstream damaged(file, std::ios::in | std::ios::out | std::ios::binary);
+    damaged.seekp(-1, std::ios::end); const char wrong = static_cast<char>(permutation.back() ^ 0xff);
+    damaged.write(&wrong, 1); damaged.close();
+    Check(!store.Load(key, loaded) && store.counters.rejected != 0,
+          "payload checksum did not reject a corrupted persistent entry");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -3458,6 +3815,10 @@ int main() {
       }
     };
     Run("dense buffers", TestDenseBufferTracking);
+    Run("high-fanout identity and use replacement", TestHighFanoutIdentityAndUseReplacement);
+    Run("native SRT/interpreter equivalence and read mask", TestNativeSrtMatchesInterpreterAndReadMask);
+    Run("shader disk cache roundtrip/reopen/corruption", TestShaderDiskCacheRoundtripAndReopen);
+    Run("owned graphics checkpoint history", TestGraphicsCheckpointHistory);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);

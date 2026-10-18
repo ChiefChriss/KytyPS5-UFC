@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -386,7 +387,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
-	const auto command = scheduler.Current().Handle();
+	const auto command = scheduler.Current().Recorder();
 	const ImageSubresourceRange range {read_desc.view_info.base_level, 1,
 	                                  read_desc.view_info.base_layer,
 	                                  read_desc.view_info.layer_count};

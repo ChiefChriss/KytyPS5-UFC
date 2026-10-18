@@ -1,5 +1,5 @@
 param(
-    [string]$GameDir = "E:\ps5 games\UFC5-extracted",
+    [string]$GameDir = $(if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'transfer-settings.json')) { (Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'transfer-settings.json') -Raw | ConvertFrom-Json).GameDir } else { 'E:\ps5 games\UFC5-extracted' }),
     # Run a copied install so a concurrent Build-Windows.ps1 never finds this exe locked and kills it.
     [string]$Emulator = (Join-Path $PSScriptRoot '_Build\windows\install\kyty_emulator.exe'),
     [int]$MonitorSeconds = 180,
@@ -12,6 +12,8 @@ param(
     # Unserialized per-command buffer markers; on by default so clean runs still locate a loss.
     [switch]$NoGpuBreadcrumbs,
     [switch]$ShaderDump,
+    # Guest SysV red-zone protection (--redzone). Also enabled by _Build\claude-runner\redzone.flag.
+    [switch]$RedZone,
     [ValidateSet('None', 'Size', 'Performance')][string]$ShaderOptimization = 'Performance',
     [int]$TracySeconds = 30,
     [int]$TracyStartSeconds = 120,
@@ -24,10 +26,20 @@ param(
     [string]$Python = "py",
     [string[]]$PythonArgs = @('-3.13'),
     [switch]$DisableFightWatch,
-    [ValidateRange(10, 300)][int]$FightStallSeconds = 45
+    [ValidateRange(10, 300)][int]$FightStallSeconds = 45,
+    # Keep the Windows display composited for the whole run so PrintWindow capture is valid even
+    # when the PC is idle (DISPLAY: none otherwise makes the client area read back black).
+    [bool]$KeepDisplayOn = $true,
+    # PrintWindow cannot read this Vulkan window's client area; capture the composited screen
+    # region instead (requires the window to be visible, which KeepDisplayOn/topmost ensures).
+    [bool]$ScreenCapture = $true
 )
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+# A previous emulator that is still exiting holds ~14 GiB of reserved guest address space, and a
+# new launch then fails with "failed to reserve guest address space". Wait for it to go away.
+for ($w = 0; $w -lt 90 -and (Get-Process -Name kyty_emulator -ErrorAction SilentlyContinue); $w++) { Start-Sleep -Seconds 1 }
+Start-Sleep -Seconds 20
 $session = Join-Path $root ("_Build\autolab\" + $Label + "-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $session -Force | Out-Null
 $emu = $Emulator
@@ -42,14 +54,36 @@ using System.Runtime.InteropServices;
 public static class WinCap {
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hwnd, out RECT r);
+    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hwnd, ref POINT p);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     public struct RECT { public int L,T,R,B; }
-    public static double ShotBrightness(IntPtr hwnd, string path) {
+    public struct POINT { public int X,Y; }
+    // PrintWindow returns a black client area for this Vulkan window even when the game renders
+    // (verified by comparing against a desktop screen capture). Capture the composited screen
+    // region instead; the caller keeps the window visible/topmost first. Brightness ignores the
+    // title bar so a black client area is not masked by it.
+    public static double ShotBrightness(IntPtr hwnd, string path, bool screenCapture) {
         RECT r; GetWindowRect(hwnd, out r);
+        int x = Math.Max(r.L, 0), y = Math.Max(r.T, 0);
         int w = Math.Max(r.R - r.L, 1), h = Math.Max(r.B - r.T, 1);
         using (var bmp = new Bitmap(w, h, PixelFormat.Format24bppRgb)) {
-            using (var g = Graphics.FromImage(bmp)) {
-                IntPtr hdc = g.GetHdc();
-                try { PrintWindow(hwnd, hdc, 2); } finally { g.ReleaseHdc(hdc); }
+            if (screenCapture) {
+                using (var g = Graphics.FromImage(bmp)) {
+                    g.CopyFromScreen(x, y, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+                }
+            } else {
+                using (var g = Graphics.FromImage(bmp)) {
+                    IntPtr hdc = g.GetHdc();
+                    try { PrintWindow(hwnd, hdc, 2); } finally { g.ReleaseHdc(hdc); }
+                }
             }
             bmp.Save(path, ImageFormat.Png);
             var d = bmp.LockBits(new Rectangle(0,0,w,h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
@@ -58,8 +92,9 @@ public static class WinCap {
                 var buf = new byte[stride * h];
                 Marshal.Copy(d.Scan0, buf, 0, buf.Length);
                 long sum = 0; long n = 0;
-                for (int y = 0; y < h; y += 8) for (int x = 0; x < w; x += 8) {
-                    int i = y * stride + x * 3;
+                int top = Math.Min(40, Math.Max(h - 1, 0));
+                for (int yy = top; yy < h; yy += 8) for (int xx = 0; xx < w; xx += 8) {
+                    int i = yy * stride + xx * 3;
                     sum += buf[i] + buf[i + 1] + buf[i + 2]; n++;
                 }
                 return (double)sum / (n * 3.0);
@@ -68,6 +103,23 @@ public static class WinCap {
     }
 }
 "@ -ReferencedAssemblies System.Drawing
+
+# Screen capture (CopyFromScreen) works in physical pixels; make this process DPI-aware so
+# GetWindowRect returns matching coordinates instead of DPI-virtualized ones.
+$null = [WinCap]::SetProcessDPIAware()
+
+# Keep the display composited for the duration of the run. With only a SYSTEM power request the
+# monitor/compositor can turn off while the PC is idle, and PrintWindow then returns a black
+# client area even though the emulator presents frames (Dev 095/097 finding). This is a
+# thread-scoped request released at the end of the script; it is not a persistent power-plan edit.
+$ES_CONTINUOUS        = [uint32]2147483648
+$ES_DISPLAY_REQUIRED  = [uint32]2
+$ES_SYSTEM_REQUIRED   = [uint32]1
+if ($KeepDisplayOn) {
+    $keepAwakeFlags = [uint32](2147483648 -bor 2 -bor 1)
+    $null = [WinCap]::SetThreadExecutionState($keepAwakeFlags)
+    Write-Host 'AutoFight: display keep-awake requested (valid PrintWindow capture overnight)'
+}
 
 function Quote([string]$s) { if ($s -match '[\s"]') { '"' + ($s -replace '"', '\"') + '"' } else { $s } }
 
@@ -81,12 +133,146 @@ $emuArgs = @('--game', $GameDir, '--screen-width', $ScreenWidth, '--screen-heigh
     '--shader-optimization-type', $ShaderOptimization,
     '--printf-direction', 'Silent', '--profile', '--spirv-debug-printf', 'false',
     '--keymap', 'Cross=F9')
+if ($RedZone -or (Test-Path (Join-Path $root '_Build\claude-runner\redzone.flag'))) {
+    $emuArgs += @('--redzone')
+    Write-Host 'AutoFight: guest red-zone protection enabled (--redzone)'
+}
 if ($ShaderDump) {
     $emuArgs += @('--shader-log-direction', 'File', '--shader-log-folder', (Join-Path $session 'shaders'),
         '--graphics-debug-dump', 'true')
 } else {
     $emuArgs += @('--shader-log-direction', 'Silent')
 }
+# Dirty-log diagnostics by label (process-scoped env, inherited by the emulator):
+# '*dlverify*' = dirty log + verify walk (counts/repairs misses), '*dlon*' = dirty log only.
+Remove-Item Env:KYTY_UFC_BDA_DIRTY_LOG, Env:KYTY_UFC_BDA_DIRTY_VERIFY -ErrorAction SilentlyContinue
+if ($Label -match 'dlverify') {
+    $env:KYTY_UFC_BDA_DIRTY_LOG = '1'; $env:KYTY_UFC_BDA_DIRTY_VERIFY = '1'
+    Write-Host 'AutoFight: BDA dirty log ON with verify (label)'
+} elseif ($Label -match 'dlon') {
+    $env:KYTY_UFC_BDA_DIRTY_LOG = '1'
+    Write-Host 'AutoFight: BDA dirty log ON (label)'
+}
+# Generation-gated BDA walk by label: '*bdagen*' (KYTY_UFC_BDA_SYNC_GENERATION=1, default OFF).
+# '*bdagenverify*' additionally runs the exact skip oracle (KYTY_UFC_BDA_SYNC_VERIFY=1).
+Remove-Item Env:KYTY_UFC_BDA_SYNC_GENERATION, Env:KYTY_UFC_BDA_SYNC_VERIFY -ErrorAction SilentlyContinue
+if ($Label -match 'bdagen') { $env:KYTY_UFC_BDA_SYNC_GENERATION = '1'; Write-Host 'AutoFight: BDA sync generation ON (label)' }
+if ($Label -match 'bdagenverify') { $env:KYTY_UFC_BDA_SYNC_VERIFY = '1'; Write-Host 'AutoFight: BDA sync generation verify ON (label)' }
+# Buffer GC age by label: '*gcoff*' = fixed GC age (KYTY_UFC_GC_FRAMES=0).
+Remove-Item Env:KYTY_UFC_GC_FRAMES -ErrorAction SilentlyContinue
+if ($Label -match 'gcoff') { $env:KYTY_UFC_GC_FRAMES = '0'; Write-Host 'AutoFight: GC frames OFF (label)' }
+# Guest mprotect over GPU memory by label: '*mpinv*' = invalidate (KYTY_UFC_MPROTECT_INVALIDATE=1).
+Remove-Item Env:KYTY_UFC_MPROTECT_INVALIDATE -ErrorAction SilentlyContinue
+if ($Label -match 'mpinv') { $env:KYTY_UFC_MPROTECT_INVALIDATE = '1'; Write-Host 'AutoFight: mprotect invalidation ON (label)' }
+# BDA fault buffers kept from GC by label: '*bdakeep*' (KYTY_UFC_BDA_KEEP=1).
+Remove-Item Env:KYTY_UFC_BDA_KEEP -ErrorAction SilentlyContinue
+if ($Label -match 'bdakeep') { $env:KYTY_UFC_BDA_KEEP = '1'; Write-Host 'AutoFight: BDA keep ON (label)' }
+if ($Label -match 'nokeep') { $env:KYTY_UFC_BDA_KEEP = '0'; Write-Host 'AutoFight: BDA keep OFF (label)' }
+# BDA dirty-log fast path range merge by label: '*bdamerge*' (KYTY_UFC_BDA_SYNC_MERGE=1).
+Remove-Item Env:KYTY_UFC_BDA_SYNC_MERGE -ErrorAction SilentlyContinue
+if ($Label -match 'bdamerge') { $env:KYTY_UFC_BDA_SYNC_MERGE = '1'; Write-Host 'AutoFight: BDA sync merge ON (label)' }
+# Colour-metadata paths by label: '*dcc*' = GPU DCC clear evaluator, '*fill*' = coherent fills.
+Remove-Item Env:KYTY_UFC_GPU_DCC -ErrorAction SilentlyContinue
+if ($Label -match 'dcc') { $env:KYTY_UFC_GPU_DCC = '1'; Write-Host 'AutoFight: GPU DCC ON (label)' }
+if ($Label -match 'fill') { $env:KYTY_UFC_FILL_CONVERT = '1'; Write-Host 'AutoFight: fill convert ON (label)' }
+# Texture GC age in frames by label: '*texgc*' (KYTY_UFC_TEX_GC_FRAMES=1).
+Remove-Item Env:KYTY_UFC_TEX_GC_FRAMES -ErrorAction SilentlyContinue
+if ($Label -match 'texgc') { $env:KYTY_UFC_TEX_GC_FRAMES = '1'; Write-Host 'AutoFight: texture GC frames ON (label)' }
+# GPU-sourced indirect draws by label: '*gpuind*' (KYTY_UFC_GPU_INDIRECT=1).
+Remove-Item Env:KYTY_UFC_GPU_INDIRECT -ErrorAction SilentlyContinue
+if ($Label -match 'gpuind') { $env:KYTY_UFC_GPU_INDIRECT = '1'; Write-Host 'AutoFight: GPU indirect ON (label)' }
+if ($Label -match 'noind') { $env:KYTY_UFC_GPU_INDIRECT = '0'; Write-Host 'AutoFight: GPU indirect OFF (label)' }
+# Native-image backing pool by label: '*imgpool*' (KYTY_UFC_IMAGE_POOL=1, default OFF).
+Remove-Item Env:KYTY_UFC_IMAGE_POOL -ErrorAction SilentlyContinue
+if ($Label -match 'imgpool') { $env:KYTY_UFC_IMAGE_POOL = '1'; Write-Host 'AutoFight: image backing pool ON (label)' }
+# BDA page-table zero-init by label: '*bdainit*' (KYTY_UFC_BDA_TABLE_INIT=1).
+Remove-Item Env:KYTY_UFC_BDA_TABLE_INIT -ErrorAction SilentlyContinue
+if ($Label -match 'bdainit') { $env:KYTY_UFC_BDA_TABLE_INIT = '1'; Write-Host 'AutoFight: BDA table init ON (label)' }
+# SRT materialization memo by label: '*srtshadow*' = shadow-verify, '*srtmemo*' = reuse.
+Remove-Item Env:KYTY_UFC_SRT_MEMO -ErrorAction SilentlyContinue
+if ($Label -match 'srtshadow') {
+    $env:KYTY_UFC_SRT_MEMO = 'shadow'; Write-Host 'AutoFight: SRT memo shadow (label)'
+} elseif ($Label -match 'srtmemo') {
+    $env:KYTY_UFC_SRT_MEMO = '1'; Write-Host 'AutoFight: SRT memo ON (label)'
+}
+# HTile metadata-clear memo by label: '*memoclear*' (KYTY_UFC_META_CLEAR_MEMO=1);
+# '*memoclearverify*' additionally compares every memo hit against the locked lookup.
+Remove-Item Env:KYTY_UFC_META_CLEAR_MEMO, Env:KYTY_UFC_META_CLEAR_MEMO_VERIFY -ErrorAction SilentlyContinue
+if ($Label -match 'memoclear') {
+    $env:KYTY_UFC_META_CLEAR_MEMO = '1'; Write-Host 'AutoFight: metadata-clear memo ON (label)'
+}
+if ($Label -match 'memoclearverify') {
+    $env:KYTY_UFC_META_CLEAR_MEMO_VERIFY = '1'; Write-Host 'AutoFight: metadata-clear memo verify ON (label)'
+}
+# Engine presented-frame dump by label: '*framedump*' writes presented frames to
+# <session>\frames (KYTY_UFC_FRAME_DUMP), independent of the desktop compositor.
+Remove-Item Env:KYTY_UFC_FRAME_DUMP -ErrorAction SilentlyContinue
+if ($Label -match 'framedump') {
+    $env:KYTY_UFC_FRAME_DUMP = (Join-Path $session 'frames')
+    Write-Host 'AutoFight: engine presented-frame dump ON (label)'
+}
+# Per-thread host CPU sampler by label: '*threadcpu*' (KYTY_UFC_THREAD_CPU=1). It prints the
+# busy-core split per host thread every 30 s so the frame-rate-limiting thread can be identified.
+Remove-Item Env:KYTY_UFC_THREAD_CPU -ErrorAction SilentlyContinue
+if ($Label -match 'threadcpu') {
+    $env:KYTY_UFC_THREAD_CPU = '1'; Write-Host 'AutoFight: per-thread CPU sampler ON (label)'
+}
+# End-of-pipe labels written at host completion by label: '*labeleop*' (KYTY_UFC_LABEL_AT_HOST_EOP=1).
+Remove-Item Env:KYTY_UFC_LABEL_AT_HOST_EOP -ErrorAction SilentlyContinue
+if ($Label -match 'labeleop') { $env:KYTY_UFC_LABEL_AT_HOST_EOP = '1'; Write-Host 'AutoFight: labels at host EOP (label)' }
+# End-of-pipe interrupts at parse time by label: '*earlyirq*' (KYTY_UFC_EARLY_EOP_IRQ=1).
+Remove-Item Env:KYTY_UFC_EARLY_EOP_IRQ -ErrorAction SilentlyContinue
+if ($Label -match 'earlyirq') { $env:KYTY_UFC_EARLY_EOP_IRQ = '1'; Write-Host 'AutoFight: early EOP interrupts (label)' }
+# Dev 094 all-on bisect. Every feature below is ON by default in the emulator. A label containing
+# 'bis-<letters>' turns the lettered features OFF for that run, e.g. 'd094-bis-abcdefgh' turns off
+# the first eight. Each run prints the full ON/OFF table so results can be bisected afterwards.
+$bisectFeatures = [ordered]@{
+    a = @('KYTY_UFC_GPU_DCC', '0', 'GPU DCC clear check')
+    b = @('KYTY_UFC_FILL_CONVERT', '0', 'colour-metadata fill conversion')
+    c = @('KYTY_UFC_BDA_DIRTY_LOG', '0', 'BDA dirty log')
+    d = @('KYTY_UFC_SRT_MEMO', '0', 'SRT memo reuse')
+    e = @('KYTY_UFC_TEX_GC_FRAMES', '0', 'texture GC frame age')
+    f = @('KYTY_UFC_BDA_TABLE_INIT', '0', 'BDA page-table zero init')
+    g = @('KYTY_UFC_MPROTECT_INVALIDATE', '0', 'mprotect invalidation')
+    h = @('KYTY_UFC_EARLY_EOP_IRQ', '0', 'early EOP interrupts')
+    i = @('KYTY_UFC_VRAM_GC_BUDGET', '0', 'VRAM-budget GC')
+    j = @('KYTY_UFC_GPU_PRIORITY', '0', 'GPU thread priority band')
+    k = @('KYTY_UFC_ARGS_COPY', '0', 'indirect-args host copies')
+    l = @('KYTY_UFC_POWER_THROTTLING', '1', 'power-throttling opt-out')
+    m = @('KYTY_UFC_GPU_INDIRECT', '0', 'GPU-sourced indirect draws')
+    n = @('KYTY_UFC_BDA_KEEP', '0', 'BDA keep from GC')
+    o = @('KYTY_UFC_FAULT_BUFFER_INIT', '0', 'fault bitmap zero init')
+    p = @('KYTY_UFC_GC_FRAMES', '0', 'buffer GC frame age')
+}
+$bisectOff = if ($Label -match 'bis-([a-p]+)') { $Matches[1] } else { '' }
+if ($Label -match 'bis-') {
+    foreach ($key in $bisectFeatures.Keys) { Remove-Item "Env:$($bisectFeatures[$key][0])" -ErrorAction SilentlyContinue }
+}
+foreach ($key in $bisectFeatures.Keys) {
+    $feature = $bisectFeatures[$key]
+    $off = $bisectOff.Contains($key)
+    if ($off) { Set-Item -Path "Env:$($feature[0])" -Value $feature[1] }
+    $state = if ($off) { 'OFF' } elseif (Test-Path "Env:$($feature[0])") { "env=$((Get-Item "Env:$($feature[0])").Value)" } else { 'ON' }
+    Write-Host ("AutoFight feature {0} {1,-32} {2}" -f $key, $feature[2], $state)
+}
+# Multi-slot SRT materialization memo by label: '*srtmemoslots*' sets KYTY_UFC_SRT_MEMO_SLOTS=8
+# (default 1 = original single-slot behavior). Placed after the bisect table so the slots choice
+# and an optional shadow verify survive a 'bis-<letters>' label that clears the SRT-memo env var.
+Remove-Item Env:KYTY_UFC_SRT_MEMO_SLOTS -ErrorAction SilentlyContinue
+if ($Label -match 'srtmemoslots64') {
+    $env:KYTY_UFC_SRT_MEMO_SLOTS = '64'; Write-Host 'AutoFight: SRT memo slots=64 (label)'
+} elseif ($Label -match 'srtmemoslots') {
+    $env:KYTY_UFC_SRT_MEMO_SLOTS = '8'; Write-Host 'AutoFight: SRT memo slots=8 (label)'
+}
+if ($Label -match 'srtmemoslots-shadow') {
+    $env:KYTY_UFC_SRT_MEMO = 'shadow'; Write-Host 'AutoFight: SRT memo shadow verify (slots label)'
+}
+# Queue-thread submission (ported from Senaxx, Dev 117) by label: '*syncsubmit*' submits on the GPU thread (KYTY_ASYNC_SUBMIT=0).
+Remove-Item Env:KYTY_ASYNC_SUBMIT -ErrorAction SilentlyContinue
+if ($Label -match 'syncsubmit') { $env:KYTY_ASYNC_SUBMIT = '0'; Write-Host 'AutoFight: async queue submit OFF (label)' }
+# NaN/Inf tracer (Dev 119) by label: '*nantrace*' logs 'NaN trace hit' lines naming the first shader write sites that produce NaN or Inf.
+Remove-Item Env:KYTY_UFC_NAN_TRACE -ErrorAction SilentlyContinue
+if ($Label -match 'nantrace') { $env:KYTY_UFC_NAN_TRACE = '1'; Write-Host 'AutoFight: NaN trace ON (label)' }
 $argLine = ($emuArgs | ForEach-Object { Quote "$_" }) -join ' '
 $log = Join-Path $session 'console.log'
 $errLog = Join-Path $session 'stderr.log'
@@ -128,12 +314,13 @@ if (-not $DisableFightWatch) {
 }
 
 $csv = Join-Path $session 'metrics.csv'
-'t,elapsed_s,fps,proc_cpu_s,proc_rss_mb,gpu_util_pct,gpu_mem_mb,brightness' | Out-File $csv -Encoding utf8
+'t,elapsed_s,fps,proc_cpu_s,proc_rss_mb,gpu_util_pct,gpu_mem_mb,brightness,frame' | Out-File $csv -Encoding utf8
 $shot_i = 0
 $start = Get-Date
 $lastShot = -1000
 $exitReason = 'timeout'
 $build = ''
+$focusDone = $false
 $stallStart = $null
 while (((Get-Date) - $start).TotalSeconds -lt $MonitorSeconds) {
     Start-Sleep -Seconds $(if ($watchState -and $watchState.fight_detected) { 1 } else { 2 })
@@ -158,7 +345,26 @@ while (((Get-Date) - $start).TotalSeconds -lt $MonitorSeconds) {
 
     $fps = ''
     if (-not $build -and $ep.MainWindowTitle -match 'UFC Dev \d+') { $build = $Matches[0] }
+    # PrintWindow needs the DWM redirection surface active; a restored, visible window keeps it
+    # alive even with no user present. Force topmost once so occluding consoles cannot blank the
+    # client area, then bring it to the foreground.
+    if (-not $focusDone -and $ep.MainWindowHandle -ne [IntPtr]::Zero) {
+        try {
+            $hwnd = $ep.MainWindowHandle
+            if ([WinCap]::IsIconic($hwnd)) { $null = [WinCap]::ShowWindow($hwnd, 9) }
+            $HWND_TOPMOST = [IntPtr](-1)
+            $SWP = [uint32](0x0002 -bor 0x0001 -bor 0x0040)  # NOMOVE|NOSIZE|SHOWWINDOW
+            $null = [WinCap]::SetWindowPos($hwnd, $HWND_TOPMOST, 0, 0, 0, 0, $SWP)
+            $null = [WinCap]::SetForegroundWindow($hwnd)
+            Write-Host ("AutoFight: capture window visible={0} topmost-set fg={1}" -f `
+                [WinCap]::IsWindowVisible($hwnd), ([WinCap]::GetForegroundWindow() -eq $hwnd))
+        } catch { }
+        $focusDone = $true
+    }
     if ($ep.MainWindowTitle -match 'fps:\s*([\d.]+)') { $fps = $Matches[1] }
+    # The title's cumulative frame counter measures frames actually rendered between samples.
+    $frame = ''
+    if ($ep.MainWindowTitle -match 'frame:\s*(\d+)') { $frame = $Matches[1] }
     if ($watchState -and $watchState.fight_detected -and $fps -ne '' -and [double]$fps -eq 0) {
         if ($null -eq $stallStart) { $stallStart = Get-Date }
         if (((Get-Date) - $stallStart).TotalSeconds -ge $FightStallSeconds) {
@@ -179,10 +385,10 @@ while (((Get-Date) - $start).TotalSeconds -lt $MonitorSeconds) {
     if (($elapsed - $lastShot) -ge $ScreenshotEverySec -and $ep.MainWindowHandle -ne [IntPtr]::Zero) {
         $shot = Join-Path $session ("shot_{0:D4}.png" -f $shot_i); $shot_i++
         $lastShot = $elapsed
-        try { $bright = [math]::Round([WinCap]::ShotBrightness($ep.MainWindowHandle, $shot), 1) } catch { $bright = 'ERR' }
+        try { $bright = [math]::Round([WinCap]::ShotBrightness($ep.MainWindowHandle, $shot, [bool]$ScreenCapture), 1) } catch { $bright = 'ERR' }
     }
     $rss = [math]::Round($ep.WorkingSet64 / 1MB, 1)
-    "$((Get-Date).ToString('HH:mm:ss')),$elapsed,$fps,$([math]::Round($ep.CPU,1)),$rss,$gu,$gm,$bright" | Out-File $csv -Append -Encoding utf8
+    "$((Get-Date).ToString('HH:mm:ss')),$elapsed,$fps,$([math]::Round($ep.CPU,1)),$rss,$gu,$gm,$bright,$frame" | Out-File $csv -Append -Encoding utf8
 }
 
 $exitCode = ''
@@ -270,6 +476,9 @@ shader_validation=$([bool]$ShaderValidation)
 gpu_crash_diagnostics=$([bool]$GpuCrashDiagnostics)
 gpu_breadcrumbs=$(-not $NoGpuBreadcrumbs)
 tracy_seconds=$TracySeconds
+tracy_start_seconds=$TracyStartSeconds
+screenshot_every_sec=$ScreenshotEverySec
+shader_dump=$([bool]$ShaderDump)
 session=$session
 exit_reason=$exitReason
 exit_code=$exitCode
@@ -300,3 +509,4 @@ if ((Test-Path -LiteralPath $csvExport) -and (Test-Path -LiteralPath $tracyOut))
 $summary | Out-File (Join-Path $session 'summary.txt') -Encoding utf8
 Write-Host $summary
 Write-Host "Triage: $(Join-Path $session 'triage.md')"
+if ($KeepDisplayOn) { $null = [WinCap]::SetThreadExecutionState($ES_CONTINUOUS) }

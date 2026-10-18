@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -349,13 +350,24 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 
 void RewriteToSsa(const BlockList& blocks) {
 	Pass pass;
+	// Senaxx bb7330cc / Braun: seal after all predecessor definitions are filled.
+	// Loop back-edges keep their headers unsealed until the final pass.
+	std::unordered_set<const Block*> filled;
+	filled.reserve(blocks.size());
 	for (auto* block: blocks) {
+		if (std::ranges::all_of(block->ImmPredecessors(),
+		    [&](const Block* predecessor) { return filled.contains(predecessor); })) {
+			pass.Seal(block);
+		}
 		for (auto& inst: *block) {
 			VisitInstruction(pass, block, inst);
 		}
+		filled.insert(block);
 	}
 	for (auto* block: blocks) {
-		pass.Seal(block);
+		if (!block->IsSsaSealed()) {
+			pass.Seal(block);
+		}
 	}
 }
 

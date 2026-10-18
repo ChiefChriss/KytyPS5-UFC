@@ -34,6 +34,14 @@ def summarize(rows, watch):
         elapsed = float(current['elapsed_s']) - float(previous['elapsed_s'])
         if before is not None and after is not None and elapsed > 0 and after >= before:
             cpu_cores.append((after - before) / elapsed)
+    # Frames rendered over the fight from the window title's cumulative counter. Sampled FPS
+    # values depend on when the title refreshed; this is the comparable throughput metric.
+    frames = sorted((t, f) for row in fight
+                    if (t := number(row.get('elapsed_s'))) is not None
+                    and (f := number(row.get('frame'))) is not None)
+    frame_span = frames[-1][0] - frames[0][0] if len(frames) >= 2 else 0
+    frame_count = frames[-1][1] - frames[0][1] if len(frames) >= 2 else -1
+    counted = frame_span > 0 and frame_count >= 0
     return {
         'fight_samples': len(fight),
         'fight_fps_samples': len(fps),
@@ -42,6 +50,8 @@ def summarize(rows, watch):
         'fight_max_sample_gap_s': round(max(gaps), 2) if gaps else 'n/a',
         'fight_120s_observed': duration >= 120,
         'fight_median_fps': statistics.median(fps) if fps else 'n/a',
+        'fight_frames': int(frame_count) if counted else 'n/a',
+        'fight_frame_rate': round(frame_count / frame_span, 2) if counted else 'n/a',
         'fight_min_fps': min(fps) if fps else 'n/a',
         'fight_zero_fps_samples': fps.count(0),
         'fight_cpu_intervals': len(cpu_cores),

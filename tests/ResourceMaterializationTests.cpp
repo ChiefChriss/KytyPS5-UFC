@@ -163,6 +163,41 @@ void TestMappedSrtUsesDirectReaderByDefault() {
         "cache rematerialization did not use the direct reader by default");
 }
 
+void TestSrtReadLogReplayDetectsChanges() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  uint32_t dword = 0x12345678;
+  auto plan = SrtPlan(reinterpret_cast<uint64_t>(&dword));
+  uint32_t specialization_reads = 0;
+  const SrtRuntime runtime{.userdata = &specialization_reads,
+                           .read_specialization_memory =
+                               RejectSpecializationRead};
+  ResourceSnapshot plain;
+  ResourceSnapshot logged;
+  ResourceSpecialization plain_specialization;
+  ResourceSpecialization logged_specialization;
+  SrtReadLog log;
+  Check(MaterializeResources(plan, runtime, plain, plain_specialization) &&
+            MaterializeResources(plan, runtime, logged, logged_specialization, &log),
+        "logged materialization failed");
+  Check(logged.flattened_srt == plain.flattened_srt &&
+            logged_specialization == plain_specialization,
+        "read log changed the materialized result");
+  Check(log.records.size() == 1 && !log.records[0].strict && log.records[0].ok &&
+            log.records[0].address == reinterpret_cast<uint64_t>(&dword) &&
+            log.values.size() == 1 && log.values[0] == 0x12345678u,
+        "read log did not record the SRT read");
+  Check(specialization_reads == 0, "read log used the specialization reader");
+  uint64_t replayed = 0;
+  Check(ReplaySrtReads(runtime, log, replayed) && replayed == 1,
+        "unchanged replay was rejected");
+  dword = 0x9abcdef0u;
+  Check(!ReplaySrtReads(runtime, log, replayed), "changed guest word was not detected");
+  Check(MaterializeResources(plan, runtime, logged, logged_specialization, &log) &&
+            logged.flattened_srt.size() == 1 && logged.flattened_srt[0] == dword &&
+            log.values.size() == 1 && log.values[0] == dword,
+        "rematerialization did not refresh the log");
+}
+
 void TestIntegerRuntimeValueFollowsSrtReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = SrtPlan(0x10000);
@@ -458,6 +493,7 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
+  TestSrtReadLogReplayDetectsChanges();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
   TestWrittenDescriptorUsesStrictReaderOnce();

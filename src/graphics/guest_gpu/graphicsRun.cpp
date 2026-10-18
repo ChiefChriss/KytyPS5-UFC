@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -24,6 +25,8 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -52,6 +55,21 @@ struct DrawIndexedIndirectArgs {
 	uint32_t base_vertex_location;
 	uint32_t start_instance_location;
 };
+
+// Indexed guest arguments are word-for-word VkDrawIndexedIndirectCommand (vertexOffset is
+// bit-compatible with baseVertex); the GPU path issues them without a CPU read.
+static_assert(sizeof(DrawIndirectArgs) == sizeof(vk::DrawIndirectCommand));
+static_assert(sizeof(DrawIndexedIndirectArgs) == sizeof(vk::DrawIndexedIndirectCommand));
+static_assert(offsetof(DrawIndexedIndirectArgs, index_count_per_instance) ==
+              offsetof(vk::DrawIndexedIndirectCommand, indexCount));
+static_assert(offsetof(DrawIndexedIndirectArgs, instance_count) ==
+              offsetof(vk::DrawIndexedIndirectCommand, instanceCount));
+static_assert(offsetof(DrawIndexedIndirectArgs, start_index_location) ==
+              offsetof(vk::DrawIndexedIndirectCommand, firstIndex));
+static_assert(offsetof(DrawIndexedIndirectArgs, base_vertex_location) ==
+              offsetof(vk::DrawIndexedIndirectCommand, vertexOffset));
+static_assert(offsetof(DrawIndexedIndirectArgs, start_instance_location) ==
+              offsetof(vk::DrawIndexedIndirectCommand, firstInstance));
 
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
@@ -205,6 +223,9 @@ void CommandProcessor::Reset() {
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
+	m_num_instances_pending            = false;
+	m_num_instances_args               = 0;
+	m_num_instances_args_size          = 0;
 	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
@@ -247,6 +268,7 @@ void CommandProcessor::BufferFlush() {
 
 void CommandProcessor::BufferWait() {
 	BufferInit();
+	const ScopedWaitSite wait_site(WaitSite::GuestSync);
 	GetScheduler().Finish();
 }
 
@@ -409,6 +431,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
+		buffer_cache.RecordPendingArgsCopies();
 		return;
 	}
 	bool src_gds = false;
@@ -420,6 +443,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	}
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
+	buffer_cache.RecordPendingArgsCopies();
 }
 
 void GuestGpu::Enqueue(Submission submission) {
@@ -442,6 +466,10 @@ void GuestGpu::WaitForIdle() {
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
+	Common::OptOutThreadPowerThrottling();
+	Common::PinThreadToPerformanceCores("Gpu");
+	// KYTY_UFC_GPU_PRIORITY=1: keep the command processor above the guest job workers.
+	Common::RaiseThreadAboveGuest("Gpu");
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
@@ -653,6 +681,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
+	const ScopedFaultSite fault_site(WaitSite::CpReadFault);
 	ProcessPm4(execution);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
@@ -794,8 +823,72 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
-	m_num_instances = num_instances;
+	m_num_instances           = num_instances;
+	m_num_instances_pending   = false;
+	m_num_instances_args_size = 0;
 }
+
+uint32_t CommandProcessor::ResolveNumInstances() {
+	if (m_num_instances_pending) {
+		// A GPU-sourced indirect draw left the count unknown; read its arguments now. The
+		// host copy is usually submitted by this point, otherwise this drains like before.
+		// Both argument layouts keep instance_count at the same offset; read the pending
+		// size (16 non-indexed, 20 indexed) so the watch lookup matches the draw that
+		// recorded it.
+		const uint64_t pending_size =
+		    m_num_instances_args_size != 0 ? m_num_instances_args_size : sizeof(DrawIndirectArgs);
+		if (pending_size == sizeof(DrawIndexedIndirectArgs)) {
+			DrawIndexedIndirectArgs args {};
+			if (m_renderer.GetBufferCache().TryReadIndirectArgs(m_num_instances_args,
+			                                                    sizeof(args), &args)) {
+				WaitStats::NoteIndirectArgs(10);
+			} else {
+				WaitStats::NoteIndirectArgs(11);
+				std::memcpy(&args, reinterpret_cast<const void*>(m_num_instances_args),
+				            sizeof(args));
+			}
+			m_num_instances = args.instance_count;
+		} else {
+			DrawIndirectArgs args {};
+			if (m_renderer.GetBufferCache().TryReadIndirectArgs(m_num_instances_args,
+			                                                    sizeof(args), &args)) {
+				WaitStats::NoteIndirectArgs(10);
+			} else {
+				WaitStats::NoteIndirectArgs(11);
+				std::memcpy(&args, reinterpret_cast<const void*>(m_num_instances_args),
+				            sizeof(args));
+			}
+			m_num_instances = args.instance_count;
+		}
+		m_num_instances_pending   = false;
+		m_num_instances_args_size = 0;
+	}
+	return m_num_instances;
+}
+
+namespace {
+// On by default since Dev 093 (KYTY_UFC_GPU_INDIRECT=0 restores the CPU-read path): GPU-sourced
+// indirect draws avoid the indirect_read_fault drain (about 18 s per 5-minute fight) and measured
+// 14.15/17.73 vs 13.84/16.26 FPS (Dev 086) and 14.5/18.73 vs 13.68/16.36 (Dev 087). The explosion
+// bisect that once implicated this range was later shown to reproduce on Dev 044 without it.
+bool GpuIndirectDrawsEnabled() {
+	static const bool enabled = [] {
+		const char* setting = std::getenv("KYTY_UFC_GPU_INDIRECT");
+		return setting == nullptr || std::strcmp(setting, "0") != 0;
+	}();
+	return enabled;
+}
+
+// KYTY_UFC_GPU_INDIRECT_FIRST=0 restores the Dev 055 order (wait for a submitted host copy
+// before trying a GPU-sourced draw) for A/B runs.
+bool GpuIndirectFirstEnabled() {
+	static const bool enabled = [] {
+		const char* setting = std::getenv("KYTY_UFC_GPU_INDIRECT_FIRST");
+		return setting == nullptr || std::strcmp(setting, "0") != 0;
+	}();
+	return enabled;
+}
+} // namespace
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
@@ -851,7 +944,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = ResolveNumInstances();
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
@@ -875,27 +968,89 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+void CommandProcessor::SetIndirectOffsetLocs(uint32_t base_vtx_loc, uint32_t start_inst_loc) {
+	m_renderer.GetRenderExecutor().SetIndirectOffsetLocs(base_vtx_loc, start_inst_loc);
+}
+
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
-	const auto* args_addr =
-	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+	(void)DrawIndirectAt(m_draw_indirect_args_base_addr + data_offset, indexed);
+}
 
+bool CommandProcessor::DrawIndirectAt(uint64_t args_vaddr, bool indexed) {
+	const auto* args_addr = reinterpret_cast<const void*>(args_vaddr);
+
+	auto& buffer_cache = m_renderer.GetBufferCache();
+	// GPU-written arguments are consumed on the GPU whenever the draw is eligible: a draw
+	// recorded after the producer reads them in queue order (the barrier in
+	// TryObtainGpuIndirectArgs orders earlier submissions too), so neither the host copy
+	// (a wait for the producer's submission) nor a drain is needed. The watch stays so a
+	// deferred NUM_INSTANCES read can still use a host copy.
+	const bool gpu_first = GpuIndirectDrawsEnabled() && GpuIndirectFirstEnabled();
 	if (!indexed) {
 		DrawIndirectArgs args {};
-		std::memcpy(&args, args_addr, sizeof(args));
-		m_num_instances = args.instance_count;
+		const bool host_copy =
+		    !gpu_first && buffer_cache.TryReadIndirectArgs(args_vaddr, sizeof(args), &args);
+		if (!host_copy) {
+			// Issue the draw from the GPU-written arguments instead of waiting for a host
+			// copy or draining the GPU to read them. Indirect draws use the default
+			// render-target slice, like the CPU path below.
+			if (GpuIndirectDrawsEnabled() &&
+			    m_renderer.GetRenderExecutor().DrawAutoGpuIndirect(m_submit_id, CurrentBuffer(),
+			                                                       args_vaddr, 0)) {
+				if (gpu_first) {
+					buffer_cache.WatchIndirectArgs(args_vaddr, sizeof(args));
+				}
+				m_num_instances_pending   = true;
+				m_num_instances_args      = args_vaddr;
+				m_num_instances_args_size = sizeof(args);
+				WaitStats::NoteIndirectArgs(5);
+				return true;
+			}
+			if (!gpu_first || !buffer_cache.TryReadIndirectArgs(args_vaddr, sizeof(args), &args)) {
+				std::memcpy(&args, args_addr, sizeof(args));
+			}
+		}
+		m_num_instances         = args.instance_count;
+		m_num_instances_pending = false;
+		m_num_instances_args_size = 0;
 		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
 		               .instance_count = args.instance_count,
 		               .first_vertex   = args.start_vertex_location,
 		               .first_instance = args.start_instance_location,
 		               .offset_source  = DrawOffsetSource::IndirectArgs});
-		return;
+		return false;
 	}
 
 	DrawIndexedIndirectArgs args {};
-	std::memcpy(&args, args_addr, sizeof(args));
+	const bool host_copy =
+	    !gpu_first && buffer_cache.TryReadIndirectArgs(args_vaddr, sizeof(args), &args);
+	if (!host_copy) {
+		// Issue the draw from the GPU-written arguments instead of waiting for a host copy
+		// or draining the GPU to read them. Indexed draws use the default render-target
+		// slice, like the CPU path below.
+		if (GpuIndirectDrawsEnabled() &&
+		    m_renderer.GetRenderExecutor().DrawIndexGpuIndirect(
+		        m_submit_id, CurrentBuffer(), args_vaddr, m_index_base_addr,
+		        m_index_type_and_size, m_index_buffer_size, 0)) {
+			if (gpu_first) {
+				buffer_cache.WatchIndirectArgs(args_vaddr, sizeof(args));
+			}
+			m_num_instances_pending   = true;
+			m_num_instances_args      = args_vaddr;
+			m_num_instances_args_size = sizeof(args);
+			WaitStats::NoteIndirectArgs(6);
+			return true;
+		}
+		if (GpuIndirectDrawsEnabled()) {
+			WaitStats::NoteIndirectArgs(7);
+		}
+		if (!gpu_first || !buffer_cache.TryReadIndirectArgs(args_vaddr, sizeof(args), &args)) {
+			std::memcpy(&args, args_addr, sizeof(args));
+		}
+	}
 
 	uint64_t index_size = 0;
 	switch (m_index_type_and_size) {
@@ -921,12 +1076,15 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	}
 
 	m_num_instances = args.instance_count;
+	m_num_instances_pending   = false;
+	m_num_instances_args_size = 0;
 	DrawIndex({.index_count    = index_count,
 	           .index_addr     = index_addr,
 	           .instance_count = args.instance_count,
 	           .base_vertex    = static_cast<int32_t>(args.base_vertex_location),
 	           .first_instance = args.start_instance_location,
 	           .offset_source  = DrawOffsetSource::IndirectArgs});
+	return false;
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
@@ -951,56 +1109,14 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
 
-	uint64_t index_size = 0;
-	if (indexed) {
-		switch (m_index_type_and_size) {
-			case 0: index_size = 2; break;
-			case 1: index_size = 4; break;
-			case 2: index_size = 1; break;
-			default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
-		}
-	}
-
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
 
-		if (!indexed) {
-			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
-			m_num_instances = args->instance_count;
-			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
-			               .instance_count = args->instance_count,
-			               .first_vertex   = args->start_vertex_location,
-			               .first_instance = args->start_instance_location,
-			               .offset_source  = DrawOffsetSource::IndirectArgs});
-			continue;
-		}
-
-		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
-
-		auto* index_addr = reinterpret_cast<const void*>(
-		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
-
-		const uint32_t index_count =
-		    (m_index_buffer_size != 0
-		         ? std::min(args->index_count_per_instance, m_index_buffer_size)
-		         : args->index_count_per_instance);
-		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
-				LOGF("\t DrawIndexIndirectMulti: clamped index_count from %" PRIu32 " to %" PRIu32
-				     " using INDEX_BUFFER_SIZE\n",
-				     args->index_count_per_instance, index_count);
-			}
-		}
-
-		m_num_instances = args->instance_count;
-		DrawIndex({.index_count    = index_count,
-		           .index_addr     = index_addr,
-		           .instance_count = args->instance_count,
-		           .base_vertex    = static_cast<int32_t>(args->base_vertex_location),
-		           .first_instance = args->start_instance_location,
-		           .offset_source  = DrawOffsetSource::IndirectArgs});
+		// Preserve per-element preparation and ordering, including shader writes between
+		// elements. Only the argument source changes; GPU-owned elements need not drain.
+		const bool native = DrawIndirectAt(args_addr, indexed);
+		WaitStats::NoteIndirectArgs(native ? 8 : 9);
 	}
 }
 
@@ -1048,7 +1164,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = ResolveNumInstances();
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }
@@ -1058,6 +1174,21 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
+}
+
+// Experiment (KYTY_UFC_LABEL_AT_HOST_EOP=1): 64-bit end-of-pipe labels (event 0x14/0x28) are
+// written when the host GPU finishes the work instead of when the packet is parsed. Only data
+// writes (source 2): GPU timestamps (source 4) keep their parse-time clock, because games size
+// dynamic resolution from them. UFC 5 throttles
+// on these labels (at most 2 frames ahead) and reuses a frame's upload and constant memory once
+// the label reaches that frame's fence, so a parse-time write lets it overwrite data the host GPU
+// has not consumed yet. The deferred write is queued before the interrupt, so it lands first.
+static bool LabelAtHostEop() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UFC_LABEL_AT_HOST_EOP");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
 }
 
 template <typename T>
@@ -1166,7 +1297,14 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					if (LabelAtHostEop() && event_write_source == 0x02 &&
+					    (eop_event_type == 0x14 || eop_event_type == 0x28)) {
+						const uint64_t label = value;
+						GetScheduler().DeferPriorityOperation(
+						    [dst, label] { std::memcpy(dst, &label, sizeof(label)); });
+					} else {
+						std::memcpy(dst, &value, sizeof(value));
+					}
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -1454,6 +1592,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 }
 
 void CommandProcessor::SynchronizeGpu() {
+	const ScopedWaitSite wait_site(WaitSite::GuestSync);
 	GetScheduler().Finish();
 }
 

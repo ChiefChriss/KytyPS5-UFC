@@ -1885,6 +1885,38 @@ void TestSopkCompareImmediateExtension() {
   }
 }
 
+void TestBranchPastEndpgmDecode() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeSopp(0x05, 6), // Branch to the test after two earlier returns.
+      EncodeVop1(0x01, 0, 129),
+      EncodeSopp(0x01),
+      EncodeVop1(0x01, 0, 130),
+      EncodeSopp(0x01),
+      EncodeSopp(0x00),
+      EncodeSopp(0x00),
+      EncodeSopp(0x04, 0xfffb), // Backward branch to the middle return path.
+      EncodeVop1(0x01, 0, 131),
+      EncodeSopp(0x01),
+      0xffffffffu, // Unreferenced trailing data must remain undecoded.
+  };
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.instructions.size() == 10u &&
+            decoded.instructions.back().pc == 36u,
+        "decoder truncated a forward branch beyond an earlier S_ENDPGM");
+  const auto graph = CFG::BuildGraph(decoded);
+  Check(graph.FindBlockByPc(28u) != nullptr &&
+            graph.FindBlockByPc(12u) != nullptr,
+        "tail branch targets did not survive CFG construction");
+
+  // Kyty permits a CFG exit at the exact end of the supplied code span.
+  const uint32_t boundary[] = {EncodeSopp(0x05, 1), EncodeSopp(0x01)};
+  Decoder::DecodeProgram(boundary, decoded);
+  Check(CFG::BuildGraph(decoded).FindBlockByPc(8u) != nullptr,
+        "branch to the code-span exit was rejected");
+}
+
 void TestDisabledDebugBranches() {
   using namespace ShaderRecompiler;
   // Both debug branches fall through when conditional shader debugging is disabled.
@@ -10771,6 +10803,35 @@ void TestNewShaderRecompilerClipDisabledPosition() {
   shifted.clip_space.offset[0] += 1.0f;
   Check(MakeStageStaticKey(clipped) != MakeStageStaticKey(shifted),
         "clip-disabled viewport transform is absent from the shader cache key");
+
+  auto dynamic = clipped;
+  dynamic.clip_space.dynamic = true;
+  auto moved = dynamic;
+  moved.clip_space.scale[0] = 1942.5f;
+  moved.clip_space.scale[1] = -173.5f;
+  moved.clip_space.offset[0] = 777.0f;
+  moved.clip_space.offset[1] = 211.0f;
+  const auto dynamic_result = compile(dynamic);
+  const auto moved_result = compile(moved);
+  CheckSpirvBinaryValidates(dynamic_result.spirv);
+  CheckSpirvBinaryValidates(moved_result.spirv);
+  Check(MakeStageStaticKey(dynamic) == MakeStageStaticKey(moved) &&
+            dynamic_result.spirv == moved_result.spirv,
+        "runtime viewport changes still generate distinct shader keys or SPIR-V");
+  Check(DisassembleSpirvBinary(dynamic_result.spirv).find("PushConstant") != std::string::npos,
+        "dynamic clip-space transform does not read the push-constant bank");
+  Check(MakeStageStaticKey(dynamic) != MakeStageStaticKey(clipped),
+        "constant and runtime clip-space transforms share a shader key");
+  auto different_extent = dynamic;
+  different_extent.clip_space.half_extent[0] *= 0.5f;
+  Check(MakeStageStaticKey(dynamic) != MakeStageStaticKey(different_extent),
+        "static host clip-space extent disappeared from the key");
+  for (uint32_t i = 0; i < 128; ++i) {
+    moved.clip_space.offset[0] = static_cast<float>(i) * 1.5f;
+    moved.clip_space.scale[1] = -static_cast<float>(i + 1);
+    Check(MakeStageStaticKey(dynamic) == MakeStageStaticKey(moved),
+          "animated runtime viewport fragments the shader cache");
+  }
 }
 
 void TestNewShaderRecompilerAuxPositionExports() {
@@ -14300,6 +14361,7 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  TestBranchPastEndpgmDecode();
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();

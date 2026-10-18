@@ -173,10 +173,12 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
 	const auto pointer = FaultElementPointer(state, word);
-	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-	state.builder.AddFunction(spv::OpStore, pointer,
-	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+	// Atomic: a plain load/OR/store lets two invocations faulting on different pages of the same
+	// 32-page word overwrite each other's bit, so a missing page is never reported.
+	const auto previous = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), previous, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
@@ -1302,6 +1304,106 @@ uint32_t EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                           EmitSubgroupLocalInvocationId(state), ConstantU32(state, ~31u));
 	const auto target = Binary(state, spv::OpBitwiseOr, TypeU32(state), base, index);
 	return EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2));
+}
+
+namespace {
+
+const char* NanTraceStageName(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Vertex: return "VS";
+		case ShaderType::Pixel: return "PS";
+		case ShaderType::Fetch: return "FS";
+		case ShaderType::Compute: return "CS";
+		case ShaderType::Mesh: return "MS";
+		case ShaderType::Local: return "LS";
+		case ShaderType::TessellationControl: return "HS";
+		case ShaderType::TessellationEvaluation: return "DS";
+		default: return "??";
+	}
+}
+
+uint32_t NanTracePointer(EmitterState& state, uint64_t address) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+	                          ConstantDeviceAddress(state, address));
+	return pointer;
+}
+
+// Stamps the slot with a global order number the first time it is hit. A racing second
+// invocation may also bump the counter, but only one stamp lands.
+void EmitNanTraceRecord(EmitterState& state, uint32_t slot, uint32_t value) {
+	const auto base         = NanTrace::DeviceAddress();
+	const auto slot_address = base + sizeof(uint32_t) *
+	    (static_cast<uint64_t>(NanTrace::HeaderWords) + slot * NanTrace::SlotWords);
+	const auto slot_pointer = NanTracePointer(
+	    state, slot_address);
+	const auto current = state.builder.AllocateId();
+	// Other invocations publish with compare-exchange: every access to this location must
+	// be atomic, including the fast-path check. A plain load races even if naturally aligned.
+	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, slot_pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+	const auto unset =
+	    Binary(state, spv::OpIEqual, TypeBool(state), current, ConstantU32(state, 0));
+	EmitIfCondition(state, unset, [&]() {
+		const auto counter_pointer = NanTracePointer(state, base);
+		const auto order           = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicIIncrement, TypeU32(state), order, counter_pointer,
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+		const auto stamp =
+		    Binary(state, spv::OpIAdd, TypeU32(state), order, ConstantU32(state, 1));
+		const auto previous = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), previous,
+		                          slot_pointer, ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), stamp,
+		                          ConstantU32(state, 0));
+		const auto won = Binary(state, spv::OpIEqual, TypeBool(state), previous, ConstantU32(state, 0));
+		EmitIfCondition(state, won, [&]() {
+			// Sole CAS winner owns the payload. The stamp is a claim, NOT publication: a
+			// queue-ordered barriered snapshot waits for this entire invocation to finish.
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain,
+			                          TypePointer(state, spv::StorageClassPushConstant, TypeU32(state)),
+			                          pointer, state.push_constant_variable, ConstantU32(state, 0),
+			                          ConstantU32(state, NanTrace::EventPushDword));
+			const auto token = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), token, pointer);
+			state.builder.AddFunction(spv::OpStore, NanTracePointer(state, slot_address + 4), token,
+			                          spv::MemoryAccessAlignedMask, 4);
+			const auto raw = Unary(state, spv::OpBitcast, TypeU32Vector(state, 4), value);
+			for (uint32_t component = 0; component < 4; component++) {
+				const auto word = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, raw, component);
+				state.builder.AddFunction(spv::OpStore,
+				                          NanTracePointer(state, slot_address + 4 * (2 + component)), word,
+				                          spv::MemoryAccessAlignedMask, 4);
+			}
+		});
+	});
+}
+
+} // namespace
+
+void EmitNanTraceCheck(EmitterState& state, uint32_t value, NanTrace::Site site, uint32_t index) {
+	if (!NanTrace::Active()) {
+		return;
+	}
+	const auto* stage = NanTraceStageName(state.program.stage);
+	for (const bool infinity: {false, true}) {
+		const auto slot =
+		    NanTrace::RegisterSlot(state.program.shader_hash, stage, site, index, infinity);
+		if (slot == NanTrace::NoSlot) {
+			continue;
+		}
+		const auto flags = state.builder.AllocateId();
+		state.builder.AddFunction(infinity ? spv::OpIsInf : spv::OpIsNan, TypeBoolVector(state, 4),
+		                          flags, value);
+		const auto any = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAny, TypeBool(state), any, flags);
+		EmitIfCondition(state, any, [&]() { EmitNanTraceRecord(state, slot, value); });
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

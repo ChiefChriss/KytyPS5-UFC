@@ -4,9 +4,16 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/recompiler/NanTrace.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -17,11 +24,39 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// vkQueueSubmit, and the queue lock that present also holds, runs on a queue thread instead
+	// of the GPU thread. Frames reach the presenter only after their flip tick completed, and the
+	// presenter's own scheduler stays synchronous. KYTY_ASYNC_SUBMIT=0 submits on the GPU thread.
+	const char* async_submit = std::getenv("KYTY_ASYNC_SUBMIT");
+	const char* record_thread = std::getenv("KYTY_RECORD_THREAD");
+	if (record_thread == nullptr || std::strcmp(record_thread, "0") != 0) {
+		m_command_scheduler.EnableRecordingThread();
+	} else if (async_submit == nullptr || std::strcmp(async_submit, "0") != 0) {
+		m_command_scheduler.EnableAsyncSubmit();
+	}
+	LOGF("Async queue submit: %s\n", m_command_scheduler.AsyncSubmit() ? "on" : "off");
+	LOGF("Vulkan recording thread: %s\n", m_command_scheduler.Threaded() ? "on" : "off");
+	// KYTY_UFC_NAN_TRACE=1: a host-visible buffer the translated shaders stamp when a write site
+	// first produces NaN or Inf. Created before any shader is translated.
+	if (ShaderRecompiler::NanTrace::Requested()) {
+		m_nan_trace_buffer = std::make_unique<Buffer>(
+		    graphics, m_command_scheduler, MemoryUsage::Download, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress |
+		        vk::BufferUsageFlagBits::eTransferSrc,
+		    ShaderRecompiler::NanTrace::BufferBytes);
+		const auto mapped = m_nan_trace_buffer->Mapped();
+		EXIT_IF(mapped.size() < ShaderRecompiler::NanTrace::BufferBytes);
+		std::memset(mapped.data(), 0, static_cast<size_t>(ShaderRecompiler::NanTrace::BufferBytes));
+		m_nan_trace_buffer->Flush(0, ShaderRecompiler::NanTrace::BufferBytes);
+		m_nan_trace_snapshot = std::make_unique<NanTraceSnapshot>(graphics, m_command_scheduler);
+		ShaderRecompiler::NanTrace::Activate(m_nan_trace_buffer->BufferDeviceAddress());
+	}
 }
 
 RenderContext::~RenderContext() {
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+	ShaderRecompiler::NanTrace::Deactivate();
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
@@ -65,18 +100,59 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		// The command processor reads GPU-written indirect arguments on the GPU thread.
+		auto site = GuestGpu::IsGpuThread() ? WaitSite::GpuThreadReadFault : WaitSite::CpuReadFault;
+		if (ScopedSrtEvaluation::Active()) {
+			site = WaitSite::SrtReadFault;
+		} else if (const auto scoped = ScopedFaultSite::Current(); scoped != WaitSite::Count) {
+			site = scoped;
+		}
+		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, site);
 	}
 	return true;
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
-		return false;
+		// A host write (e.g. a file read) that straddles the edge of GPU-mapped memory used to
+		// skip invalidation entirely, leaving the GPU-mapped part write-protected and its GPU
+		// copies stale. Invalidate the mapped parts.
+		const auto bytes = InvalidateMappedOverlap(vaddr, size, true);
+		if (bytes != 0) {
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Partial GPU-memory invalidation: addr=0x{:x} size=0x{:x} mapped=0x{:x}\n",
+				    vaddr, size, bytes));
+			}
+		}
+		return bytes != 0;
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
+}
+
+uint64_t RenderContext::InvalidateMappedOverlap(uint64_t vaddr, uint64_t size, bool invalidate) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	std::vector<GuestRange> parts;
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEachInRange(vaddr, size, [&](uint64_t start, uint64_t end) {
+			parts.push_back({start, end - start});
+		});
+	}
+	uint64_t bytes = 0;
+	for (const auto& part: parts) {
+		bytes += part.size;
+		if (invalidate) {
+			m_buffer_cache.InvalidateMemory(part.address, part.size);
+			m_texture_cache.InvalidateMemory(part.address, part.size);
+		}
+	}
+	return bytes;
 }
 
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
@@ -90,6 +166,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	++m_mapped_ranges_version;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -108,6 +185,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		++m_mapped_ranges_version;
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -124,7 +202,7 @@ void RenderContext::PrepareBda() {
 		m_bda_logged = true;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges);
+	m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, m_mapped_ranges_version);
 	m_fault_process_pending = true;
 }
 
@@ -134,8 +212,24 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+	if (m_gpu != nullptr) {
+		m_texture_cache.SetGcFrame(static_cast<uint64_t>(m_gpu->GetFrameNum()));
+		m_buffer_cache.SetGcFrame(static_cast<uint64_t>(m_gpu->GetFrameNum()));
+	}
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+	if (m_nan_trace_buffer != nullptr && m_gpu != nullptr) {
+		const auto frame = static_cast<uint64_t>(m_gpu->GetFrameNum());
+		if (frame != m_nan_trace_frame) {
+			m_nan_trace_frame = frame;
+			if (auto snapshot = m_nan_trace_snapshot->Consume()) {
+				ShaderRecompiler::NanTrace::Poll(snapshot->frame, snapshot->tick, snapshot->words);
+			}
+			if (m_command_scheduler.Active()) {
+				m_nan_trace_snapshot->Record(*m_nan_trace_buffer, frame);
+			}
+		}
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_set>
 
@@ -301,14 +302,103 @@ private:
 
 } // namespace
 
+namespace {
+thread_local bool g_native_suppressed = false;
+SrtNativeStats g_native_stats;
+bool g_native_report = false;
+
+bool NativeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_NATIVE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+bool NativeVerify() {
+	static const bool verify = [] {
+		const char* value = std::getenv("KYTY_SRT_NATIVE_VERIFY");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return verify;
+}
+} // namespace
+
+bool TakeSrtNativeReport(SrtNativeStats& stats) {
+	if (!g_native_report) return false;
+	g_native_report = false;
+	stats = g_native_stats;
+	return true;
+}
+
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
                      Value active_mask)
     : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
-      m_context(AcquireContext(program)) {}
+      m_context(AcquireContext(program)) { BindNative(); }
 
 SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
+
+void SrtWalker::BindNative() {
+	if (!NativeEnabled() || g_native_suppressed || !m_active_mask.IsEmpty() ||
+	    !SrtNativeCode::Supported()) return;
+	if (!m_program.native_code) {
+		if (m_program.native_attempted || ++m_program.native_uses < 8) return;
+		m_program.native_attempted = true;
+		m_program.native_code = SrtNativeCode::Compile(m_program);
+		if (m_program.native_code) {
+			g_native_stats.plans++;
+			g_native_stats.bytes += m_program.native_code->CodeSize();
+			g_native_stats.instructions += m_program.native_code->Instructions();
+			g_native_stats.interpreted += m_program.native_code->Interpreted();
+		} else {
+			g_native_stats.failed++;
+		}
+		const auto total = g_native_stats.plans + g_native_stats.failed;
+		if ((total & (total - 1u)) == 0) g_native_report = true;
+		if (!m_program.native_code) return;
+	}
+	if (m_clean_evaluator != nullptr) {
+		if (m_clean_evaluator->m_native != m_program.native_code.get() ||
+		    m_clean_evaluator->m_native_mode != SrtNativeMode::Self ||
+		    &m_clean_evaluator->m_program != &m_program ||
+		    m_clean_flat_slots.size() != m_program.clean_flat_slots.size() ||
+		    !std::equal(m_clean_flat_slots.begin(), m_clean_flat_slots.end(), m_program.clean_flat_slots.begin())) return;
+		m_native_mode = SrtNativeMode::Split;
+	}
+	if (m_context.values.size() < m_program.evaluation_value_count)
+		m_context.values.resize(m_program.evaluation_value_count);
+	m_native_frame.memo = m_context.values.data();
+	m_native_frame.generation = m_context.generation;
+	m_native_frame.user_data = m_runtime.user_data.data();
+	m_native_frame.user_data_size = m_runtime.user_data.size();
+	m_native_frame.shader_base = m_runtime.shader_base;
+	m_native_frame.walker = this;
+	m_native_frame.clean = m_clean_evaluator ? &m_clean_evaluator->m_native_frame : nullptr;
+	m_native_frame.failed = &m_failed_value;
+	m_native = m_program.native_code.get();
+}
+
+bool SrtWalker::VerifyNative(Value value, bool ok, uint64_t result) {
+	struct Suppress { bool before; Suppress(): before(g_native_suppressed) { g_native_suppressed=true; }
+	                  ~Suppress() { g_native_suppressed=before; } } suppressed;
+	uint64_t reference = 0;
+	bool reference_ok;
+	if (m_clean_evaluator) {
+		SrtWalker clean(m_program, m_clean_evaluator->m_runtime);
+		SrtWalker walker(m_program, m_runtime, m_clean_flat_slots, &clean);
+		reference_ok = walker.EvaluateWide(value, reference);
+	} else {
+		SrtWalker walker(m_program, m_runtime);
+		reference_ok = walker.EvaluateWide(value, reference);
+	}
+	if (ok != reference_ok || (ok && result != reference)) {
+		EXIT("native SRT result differs from interpreter: shader=%016llx native_ok=%d reference_ok=%d native=%016llx reference=%016llx\n",
+		     static_cast<unsigned long long>(m_program.shader_hash), ok, reference_ok,
+		     static_cast<unsigned long long>(result), static_cast<unsigned long long>(reference));
+	}
+	return ok;
+}
 
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	uint64_t wide = 0;
@@ -356,6 +446,11 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
 	if (index >= m_context.values.size()) {
 		m_context.values.resize(m_program.evaluation_value_count);
+		m_native_frame.memo = m_context.values.data();
+	}
+	if (m_native != nullptr && m_native->Has(m_native_mode, index)) {
+		const bool ok = m_native->Evaluate(m_native_frame, m_native_mode, index, result);
+		return NativeVerify() ? VerifyNative(value, ok, result) : ok;
 	}
 	if (m_context.values[index].generation == m_context.generation) {
 		result = m_context.values[index].value;
@@ -368,6 +463,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	m_context.values[index].generation = m_context.generation | 1u;
 	uint64_t out = 0;
 	const bool evaluated = EvaluateInst(*inst, out);
+	m_native_frame.memo = m_context.values.data();
 	// Recursive evaluation may grow the dense memo vector.
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
@@ -500,7 +596,11 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
 				return false;
 			}
-			result = m_runtime.user_data[reg - m_program.user_data_base];
+			const auto index = reg - m_program.user_data_base;
+			if (m_runtime.user_data_reads != nullptr) {
+				*m_runtime.user_data_reads |= uint64_t {1} << (index < 63 ? index : 63);
+			}
+			result = m_runtime.user_data[index];
 			return true;
 		}
 		case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;

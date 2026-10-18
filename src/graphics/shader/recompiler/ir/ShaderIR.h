@@ -61,16 +61,16 @@ struct MemoryInfo {
 	uint32_t                image_sample_flags       = 0;
 	Decoder::ImageDimension image_dimension          = Decoder::ImageDimension::Unknown;
 	uint32_t                image_address_components = 0;
-	bool                    address_is_full                                       = false;
-	bool                    data_signed                                           = false;
-	bool                    typed                                                 = false;
-	bool                    formatted                                             = false;
-	bool                    image_has_mip                                         = false;
-	bool                    image_r128                                            = false;
-	bool                    idxen                                                 = false;
-	bool                    offen                                                 = false;
-	bool                    coherent                                              = false;
-	bool                    planning_only                                         = false;
+	bool                    address_is_full          = false;
+	bool                    data_signed              = false;
+	bool                    typed                    = false;
+	bool                    formatted                = false;
+	bool                    image_has_mip            = false;
+	bool                    image_r128               = false;
+	bool                    idxen                    = false;
+	bool                    offen                    = false;
+	bool                    coherent                 = false;
+	bool                    planning_only            = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		return !formatted && !typed && data_bits == 32u &&
@@ -138,7 +138,7 @@ struct ImageResource {
 	bool                          cube              = false;
 	bool                          r128              = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
-	uint32_t                      indirect_mapping_offset   = 0;
+	uint32_t                      indirect_mapping_offset    = 0;
 	uint32_t                      indirect_search_iterations = 0;
 	std::vector<uint32_t>         indirect_resources;
 
@@ -146,8 +146,8 @@ struct ImageResource {
 };
 
 struct SamplerResource {
-	uint32_t source                = 0;
-	uint32_t first_use_pc          = 0;
+	uint32_t source       = 0;
+	uint32_t first_use_pc = 0;
 	// Native filtering/border variants share the original sampler's runtime descriptor.
 	uint32_t snapshot_index        = 0;
 	bool     force_point_filtering = false;
@@ -212,14 +212,13 @@ enum class StageOutputKind {
 struct PositionExportComponent {
 	uint32_t clip_distance = UINT32_MAX;
 	uint32_t cull_distance = UINT32_MAX;
-	bool     point_size     = false;
-	bool     layer          = false;
-	bool     viewport       = false;
+	bool     point_size    = false;
+	bool     layer         = false;
+	bool     viewport      = false;
 };
 
-inline PositionExportComponent DecodePositionExportComponent(uint32_t control,
-	                                                           uint32_t pos_index,
-	                                                           uint32_t component) {
+inline PositionExportComponent DecodePositionExportComponent(uint32_t control, uint32_t pos_index,
+                                                             uint32_t component) {
 	PositionExportComponent result;
 	if (pos_index == 0 || component >= 4) {
 		return result;
@@ -299,16 +298,22 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 55u);
 
 struct PushData {
-	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 6;
-	static constexpr uint32_t NoStart    = UINT32_MAX;
+	static constexpr uint32_t               DwordCount              = 32;
+	static constexpr uint32_t               MeshDrawDwordCount      = 6;
+	static constexpr uint32_t               ClipTransformDwordCount = 4;
+	[[nodiscard]] static constexpr uint32_t ClipTransformStart(ShaderType stage) {
+		return stage == ShaderType::Mesh ? MeshDrawDwordCount : 0;
+	}
+	static constexpr uint32_t        NoStart = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
 	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
 		return size != 0 && start <= DwordCount && size <= DwordCount - start;
 	}
-	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
-		return CanFit(cursor, size) ? cursor : NoStart;
+	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size,
+	                                               uint32_t capacity = DwordCount) {
+		return CanFit(cursor, size) && cursor <= capacity && size <= capacity - cursor
+		           ? cursor : NoStart;
 	}
 };
 
@@ -421,21 +426,19 @@ struct DescriptorBinding {
 
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
-	uint32_t                       memory_offset_dword = 0;
-	uint32_t                       memory_offset_count = 0;
+	uint32_t                       memory_offset_dword   = 0;
+	uint32_t                       memory_offset_count   = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
 	}
-	[[nodiscard]] bool UsesPushData() const {
-		return push_data_start_dword != PushData::NoStart;
-	}
-	void AdvancePushData(uint32_t& cursor) const {
-		if (UsesPushData()) {
-			cursor = push_data_start_dword + ShaderDataDwords();
-		}
+	[[nodiscard]] bool UsesPushData() const { return push_data_start_dword != PushData::NoStart; }
+	void               AdvancePushData(uint32_t& cursor) const {
+        if (UsesPushData()) {
+            cursor = push_data_start_dword + ShaderDataDwords();
+        }
 	}
 
 	bool operator==(const BindingLayout& other) const = default;
@@ -454,10 +457,10 @@ struct ShaderInfo {
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
-	int32_t                          vertex_offset_sgpr = -1;
+	int32_t                          vertex_offset_sgpr   = -1;
 	int32_t                          instance_offset_sgpr = -1;
-	bool                             has_bitwise_xor    = false;
-	bool                             uses_dma           = false;
+	bool                             has_bitwise_xor      = false;
+	bool                             uses_dma             = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -473,13 +476,13 @@ struct BlockInfo {
 
 struct DescriptorSource {
 	struct IndirectImage {
-		uint32_t material_source = UINT32_MAX;
-		uint32_t table_source    = 0;
-		uint32_t selector_stride = 0;
-		uint32_t selector_offset = 0;
-		uint32_t table_offset    = 0;
-		Value    key_count;
-		Value    selector_mask;
+		uint32_t              material_source = UINT32_MAX;
+		uint32_t              table_source    = 0;
+		uint32_t              selector_stride = 0;
+		uint32_t              selector_offset = 0;
+		uint32_t              table_offset    = 0;
+		Value                 key_count;
+		Value                 selector_mask;
 		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectImage& other) const = default;
@@ -509,16 +512,16 @@ struct ResourceBlock {
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
-	ShaderType                    stage               = ShaderType::Unknown;
-	uint64_t                      shader_hash         = 0;
-	uint32_t                      wave_size           = 64;
-	uint32_t                      user_data_base      = 0;
-	uint32_t                      user_data_count     = 64;
-	uint32_t                      scratch_dwords      = 0;
-	uint32_t                      param_export_mask   = 0;
-	bool                          has_address_writes  = false;
-	ShaderInfo                    info;
-	BindingLayout                 bindings;
+	ShaderType    stage              = ShaderType::Unknown;
+	uint64_t      shader_hash        = 0;
+	uint32_t      wave_size          = 64;
+	uint32_t      user_data_base     = 0;
+	uint32_t      user_data_count    = 64;
+	uint32_t      scratch_dwords     = 0;
+	uint32_t      param_export_mask  = 0;
+	bool          has_address_writes = false;
+	ShaderInfo    info;
+	BindingLayout bindings;
 };
 
 struct UniformFillPlan {
@@ -528,6 +531,7 @@ struct UniformFillPlan {
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
+class SrtNativeCode;
 struct ResourcePlan {
 	struct EvaluationContext {
 		struct Entry {
@@ -544,33 +548,37 @@ struct ResourcePlan {
 
 	ResourcePlan(const ResourcePlan&)            = delete;
 	ResourcePlan& operator=(const ResourcePlan&) = delete;
-	ResourcePlan(ResourcePlan&&) noexcept         = default;
+	ResourcePlan(ResourcePlan&&) noexcept        = default;
 	ResourcePlan& operator=(ResourcePlan&& other) noexcept;
 
 	ShaderType                    stage           = ShaderType::Unknown;
 	uint64_t                      shader_hash     = 0;
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
-	std::list<Inst>                     value_storage;
-	std::vector<MemoryInfo>             memory_info;
-	std::vector<DescriptorSource>       descriptor_sources;
-	std::vector<ResourceBlock>          control_flow;
-	std::vector<SrtRead>                srt_reads;
-	std::vector<uint8_t>                clean_flat_slots;
-	bool                                requires_specialization_memory = false;
-	bool                                capture_specialization_reads = false;
-	bool                                srt_plan_complete          = false;
-	bool                                resource_tracking_complete = false;
-	ShaderInfo                          info;
-	UniformFillPlan                     uniform_fill;
+	std::list<Inst>               value_storage;
+	std::vector<MemoryInfo>       memory_info;
+	std::vector<DescriptorSource> descriptor_sources;
+	std::vector<ResourceBlock>    control_flow;
+	std::vector<SrtRead>          srt_reads;
+	std::vector<uint8_t>          clean_flat_slots;
+	bool                          requires_specialization_memory = false;
+	bool                          capture_specialization_reads   = false;
+	bool                          srt_plan_complete              = false;
+	bool                          resource_tracking_complete     = false;
+	ShaderInfo                    info;
+	UniformFillPlan               uniform_fill;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
-	mutable uint32_t                       evaluation_value_count = 0;
-	mutable uint32_t                       evaluation_depth       = 0;
-	mutable std::vector<uint8_t>            active_sources;
-	mutable std::vector<uint8_t>            visited_blocks;
-	mutable std::vector<uint32_t>           pending_blocks;
-	mutable std::vector<uint32_t>           material_keys;
+	mutable uint32_t                      evaluation_value_count = 0;
+	mutable uint32_t                      evaluation_depth       = 0;
+	mutable std::vector<uint8_t>          active_sources;
+	mutable std::vector<uint8_t>          visited_blocks;
+	mutable std::vector<uint32_t>         pending_blocks;
+	mutable std::vector<uint32_t>         material_keys;
+	// Executable routines are process-local scratch, never serialized into the disk cache.
+	mutable std::shared_ptr<SrtNativeCode> native_code;
+	mutable uint32_t native_uses = 0;
+	mutable bool native_attempted = false;
 };
 
 struct Program: ResourcePlan {
@@ -579,28 +587,30 @@ struct Program: ResourcePlan {
 
 	Program(const Program&)            = delete;
 	Program& operator=(const Program&) = delete;
-	Program(Program&&) noexcept         = default;
-	Program& operator=(Program&& other) noexcept;
+	Program(Program&&) noexcept        = default;
+	Program&           operator=(Program&& other) noexcept;
 	CompiledShaderInfo TakeCompiledInfo() &&;
 
 	std::vector<std::unique_ptr<Block>> block_storage;
 	BlockList                           blocks;
-	uint32_t                      wave_size      = 64;
-	uint32_t                      scratch_dwords = 0;
-	bool                          dispatcher_fallback = false;
-	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
-	std::string                   fallback_reason;
-	std::vector<BlockInfo>        block_info;
-	struct ScalarWrite { uint32_t pc; ScalarReg reg; };
-	std::vector<ScalarWrite>      scalar_writes;
+	uint32_t                            wave_size           = 64;
+	uint32_t                            scratch_dwords      = 0;
+	bool                                dispatcher_fallback = false;
+	CFG::FailureKind                    cfg_failure_kind    = CFG::FailureKind::None;
+	std::string                         fallback_reason;
+	std::vector<BlockInfo>              block_info;
+	struct ScalarWrite {
+		uint32_t  pc;
+		ScalarReg reg;
+	};
+	std::vector<ScalarWrite> scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
-	std::vector<ExportInfo>       export_info;
-	bool                          has_address_writes = false;
-	bool                          shader_info_complete = false;
-	BindingLayout                 bindings;
-	bool                          binding_layout_complete = false;
-
+	std::vector<ExportInfo> export_info;
+	bool                    has_address_writes   = false;
+	bool                    shader_info_complete = false;
+	BindingLayout           bindings;
+	bool                    binding_layout_complete = false;
 };
 
 std::string ProgramToString(const Program& program);

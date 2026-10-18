@@ -5,7 +5,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0);
+void AllocateBindings(Program& program, uint32_t push_data_start_dword = 0,
+                      uint32_t push_data_capacity = PushData::DwordCount);
 
 // Collect live direct buffer indices and report whether the shader accesses GDS.
 bool CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers);

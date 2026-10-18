@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/gpuCrashDiagnostics.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -20,12 +21,8 @@ namespace {
 
 constexpr uint64_t RING_SIZE = 1u << 16u;
 
-struct Record {
-	std::atomic<uint64_t> sequence {0};
-	CheckpointInfo        info;
-};
-
-std::array<Record, RING_SIZE> g_ring;
+CheckpointHistory<RING_SIZE> g_ring;
+std::atomic<uint64_t> g_latest_graphics_sequence {0};
 std::atomic<uint64_t>         g_next_sequence {1};
 std::atomic_flag              g_reported      = ATOMIC_FLAG_INIT;
 thread_local uint64_t         t_last_sequence = 0;
@@ -195,6 +192,8 @@ uint64_t WidenMarker(uint32_t marker, uint64_t latest) {
 	return value;
 }
 
+std::string DescribeSequence(uint64_t sequence);
+
 void LogBreadcrumbHeartbeat() {
 	const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                     std::chrono::steady_clock::now().time_since_epoch())
@@ -210,6 +209,11 @@ void LogBreadcrumbHeartbeat() {
 	Log::WriteToConsoleAndLog(
 	    fmt::format("GPU breadcrumbs: recorded={} gpu_started={} gpu_completed={}\n", latest,
 	                started, completed));
+	const auto graphics_sequence = g_latest_graphics_sequence.load(std::memory_order_relaxed);
+	if (graphics_sequence != 0) {
+		Log::WriteToConsoleAndLog(fmt::format("GPU draw checkpoint sample (recording, not fault): {}\n",
+		                                    DescribeSequence(graphics_sequence)));
+	}
 }
 
 void ReportIndirectArgs(const GraphicContext& graphics) {
@@ -254,16 +258,22 @@ const char* OpName(uint32_t op) {
 }
 
 std::string DescribeSequence(uint64_t sequence) {
-	const auto& record = g_ring[sequence % RING_SIZE];
-	if (record.sequence.load(std::memory_order_acquire) != sequence) {
+	const auto snapshot = g_ring.Read(sequence);
+	if (!snapshot) {
 		return fmt::format("seq={} (record overwritten)", sequence);
 	}
-	const auto& info = record.info;
-	return fmt::format("seq={} op={} submit={} args={},{},{},{},0x{:016x} ps=0x{:016x} "
+	const auto& info = *snapshot;
+	auto description = fmt::format("seq={} op={} submit={} args={},{},{},{},0x{:016x} ps=0x{:016x} "
 	                   "es=0x{:016x} gs=0x{:016x} shader_hash={:016x}",
 	                   sequence, OpName(info.op), info.submit_id, info.args[0], info.args[1],
 	                   info.args[2], info.args[3], info.arg4, info.ps_addr, info.es_addr,
 	                   info.gs_addr, info.shader_hash);
+	for (uint32_t i = 0; i < std::min<uint32_t>(info.graphics.count, info.graphics.stages.size()); ++i) {
+		const auto& stage = info.graphics.stages[i];
+		description += fmt::format(" graphics[{}]=type:{},hash:{:016x},program:{},wave:{}",
+		                           i, stage.type, stage.hash, stage.program_id, stage.wave_size);
+	}
+	return description;
 }
 
 void ReportBreadcrumbs() {
@@ -345,16 +355,16 @@ void ReportDeviceFault(const GraphicContext& graphics) {
 
 } // namespace
 
-void RecordCheckpoint(const GraphicContext& graphics, vk::CommandBuffer buffer,
+void RecordCheckpoint(const GraphicContext& graphics, CommandRecorder buffer,
                       const CheckpointInfo& info) {
 	if ((!graphics.checkpoints_enabled && !graphics.buffer_markers_enabled) || buffer == nullptr) {
 		return;
 	}
 	const auto sequence = g_next_sequence.fetch_add(1, std::memory_order_relaxed);
-	auto&      record   = g_ring[sequence % RING_SIZE];
-	record.sequence.store(0, std::memory_order_relaxed);
-	record.info = info;
-	record.sequence.store(sequence, std::memory_order_release);
+	g_ring.Publish(sequence, info);
+	if (info.graphics.count != 0) {
+		g_latest_graphics_sequence.store(sequence, std::memory_order_relaxed);
+	}
 	t_last_sequence = sequence;
 	if (graphics.checkpoints_enabled) {
 		buffer.setCheckpointNV(reinterpret_cast<const void*>(sequence));
@@ -379,13 +389,10 @@ void AnnotateLastCheckpoint(uint64_t shader_hash) {
 	if (t_last_sequence == 0) {
 		return;
 	}
-	auto& record = g_ring[t_last_sequence % RING_SIZE];
-	if (record.sequence.load(std::memory_order_acquire) == t_last_sequence) {
-		record.info.shader_hash = shader_hash;
-	}
+	g_ring.AnnotateCompute(t_last_sequence, shader_hash);
 }
 
-void RecordIndirectArgs(const GraphicContext& graphics, vk::CommandBuffer buffer,
+void RecordIndirectArgs(const GraphicContext& graphics, CommandRecorder buffer,
                         vk::Buffer args_buffer, uint64_t args_offset) {
 	if (!graphics.checkpoints_enabled || buffer == nullptr || args_buffer == nullptr) {
 		return;
@@ -416,7 +423,7 @@ void RecordIndirectArgs(const GraphicContext& graphics, vk::CommandBuffer buffer
 	                       {}, 1, &published, 0, nullptr, 0, nullptr);
 }
 
-void RecordLoopCountBuffer(const GraphicContext& graphics, vk::CommandBuffer command,
+void RecordLoopCountBuffer(const GraphicContext& graphics, CommandRecorder command,
                            const vk::DescriptorBufferInfo& source, uint64_t guest_address) {
 	if (!graphics.checkpoints_enabled || source.buffer == nullptr ||
 	    source.range == VK_WHOLE_SIZE || source.range < sizeof(uint32_t))

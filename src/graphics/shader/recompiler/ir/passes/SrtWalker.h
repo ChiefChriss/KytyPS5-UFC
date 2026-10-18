@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 
 #include <span>
 
@@ -17,6 +18,8 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// Optional: bit i set when user_data[i] was read (bit 63: an index >= 63 was read).
+	uint64_t*                 user_data_reads            = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -42,6 +45,10 @@ public:
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:
+	friend struct SrtNativeHelpers;
+	friend struct SrtNativeTestAccess;
+	void BindNative();
+	bool VerifyNative(Value value, bool ok, uint64_t result);
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
 	static float Float32(uint64_t bits);
 	bool EvaluateWide(Value value, uint64_t& result);
@@ -57,6 +64,10 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	SrtNativeCode* m_native = nullptr;
+	SrtNativeMode m_native_mode = SrtNativeMode::Self;
+	SrtNativeFrame m_native_frame;
+	const Inst* m_failed_value = nullptr;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -3,6 +3,8 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 
 namespace Config {
@@ -170,7 +172,15 @@ bool PlayGoHackEnabled() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
-	return g_config->red_zone_protection_enabled;
+	// UFC 5 job threads keep live values in the SysV red zone across stores that hit
+	// write-tracked pages; the Windows exception dispatch for those faults overwrites the red
+	// zone (guest null read at pc 0x9034b8c02 within ~1 minute in most sessions). Protection is
+	// therefore on by default on Windows; KYTY_UFC_REDZONE=0 turns it off.
+	const char* setting = std::getenv("KYTY_UFC_REDZONE");
+	if (setting != nullptr && std::strcmp(setting, "0") == 0) {
+		return false;
+	}
+	return true;
 }
 #endif
 

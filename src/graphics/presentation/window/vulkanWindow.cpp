@@ -638,6 +638,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		create_info.pNext        = &diagnostics_config;
 	}
 	graphics.device_fault_enabled = supported_fault.deviceFault == VK_TRUE;
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT supported_conditional {};
+	if (HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFeatures2 conditional_query {};
+		conditional_query.pNext = &supported_conditional;
+		physical_device.getFeatures2(&conditional_query);
+	}
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_features {};
+	if (supported_conditional.conditionalRendering) {
+		conditional_features.conditionalRendering = VK_TRUE;
+		conditional_features.pNext                = const_cast<void*>(create_info.pNext);
+		create_info.pNext                         = &conditional_features;
+	}
+	graphics.conditional_rendering_enabled = supported_conditional.conditionalRendering == VK_TRUE;
+	LOGF("Vulkan conditional rendering: %s\n",
+	     graphics.conditional_rendering_enabled ? "true" : "false");
 	graphics.checkpoints_enabled =
 	    HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
 	create_info.pQueueCreateInfos       = &queue_create_info;
@@ -1008,7 +1023,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

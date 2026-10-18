@@ -1,0 +1,65 @@
+// Evaluates single-mip color metadata clear codes for one slice per workgroup.
+// pred[slice * 8 + k] = 1 when every metadata byte of the slice equals candidate code k.
+// On a match the slice is expanded to 0xff, matching the CPU materialization path.
+
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer metadata_buffer {
+    uint metadata[];
+};
+
+layout(std430, binding = 1) buffer predicate_buffer {
+    uint predicates[];
+};
+
+layout(push_constant) uniform Params {
+    uint slice_words;
+    uint codes_low;
+    uint codes_high;
+    uint candidate_count;
+} params;
+
+shared uint s_mismatch;
+
+void main() {
+    const uint slice = gl_WorkGroupID.x;
+    const uint lane  = gl_LocalInvocationIndex;
+    const uint base  = slice * params.slice_words;
+    if (lane == 0u) {
+        s_mismatch = 0u;
+    }
+    barrier();
+
+    const uint code    = metadata[base] & 0xffu;
+    const uint pattern = code * 0x01010101u;
+    bool       differs = false;
+    for (uint i = lane; i < params.slice_words; i += 256u) {
+        differs = differs || metadata[base + i] != pattern;
+    }
+    if (differs) {
+        atomicOr(s_mismatch, 1u);
+    }
+    memoryBarrierBuffer();
+    barrier();
+
+    uint match = 0xffffffffu;
+    if (s_mismatch == 0u) {
+        for (uint k = 0u; k < params.candidate_count; k++) {
+            const uint candidate =
+                k < 4u ? (params.codes_low >> (8u * k)) & 0xffu : params.codes_high & 0xffu;
+            if (candidate == code) {
+                match = k;
+            }
+        }
+    }
+    if (lane < params.candidate_count) {
+        predicates[slice * 8u + lane] = match == lane ? 1u : 0u;
+    }
+    if (match != 0xffffffffu) {
+        for (uint i = lane; i < params.slice_words; i += 256u) {
+            metadata[base + i] = 0xffffffffu;
+        }
+    }
+}

@@ -65,12 +65,18 @@ The build-025 late-fight loss and the earlier post-title hangs were all nvlddmkm
 The `debug_op` in `vkQueueSubmit failed` is only the last command recorded before submit
 (`3` = EopWrite), not the failing draw.
 
-`Build-Windows.ps1` force-kills every `kyty_emulator` process if install finds the exe locked.
-When another agent may rebuild concurrently, run a copy:
-`Copy-Item _Build\windows\install _Build\install-snapshot -Recurse` then
-`AutoFight.ps1 -Emulator "$PWD\_Build\install-snapshot\kyty_emulator.exe" ...`.
+`Build-Windows.ps1` refuses to build/install/test while a launcher or emulator is active.
+It rechecks before installation/tests and retries transient install locks without killing games.
+Close only processes started by your own run. Serialize builds, CTest and gameplay.
 
 ## Persistent OpenCode supervisor
+
+The current unattended plan is `_Build/agent-reports/OVERNIGHT-PLAN-20261006.md`. It authorizes
+early-load/media diagnostics and independent engine work when blackout reproduction is
+inconclusive; the old Task-A-only deferral no longer applies. The start shortcut now requests
+process-scoped keep-awake and absent-worker recovery, and retries an unexpectedly exited
+supervisor. A live worker/manual game is never terminated; an exclusive worker lock serializes
+ownership. STOP and verified goal markers remain intentional exits.
 
 ```powershell
 py -3.13 Run-AutonomousLoop.py --dry-run
@@ -79,13 +85,30 @@ py -3.13 Run-AutonomousLoop.py --background  # detach and return the supervisor 
 ```
 
 Default cycle count is unlimited; each agent invocation performs one focused cycle.
+The current objective is stable, correct **30 FPS** actual fights, using the Dev 077 safe
+defaults and the latest verified HANDOFF candidate. Updated AnyPS5 references are recorded in
+`_Build/agent-reports/anyps5-update-comparison-20261005.md`.
+Before starting a model cycle, the supervisor checks games/launchers, active builds/tests,
+competing automation/CLI agents and a Claude runner heartbeat newer than two minutes.
+It waits without spending a cycle or model quota while blocked, and fails closed if process
+inspection fails. `py -3.13 Run-AutonomousLoop.py --preflight-only` checks this without an agent.
+Agents repeat ownership checks immediately before build/test/install/launch operations.
+When a bounded investigation cannot continue without required user information, the agent
+writes `_Build/agent-loop/WAIT-FOR-INPUT.json` with a `reason` and `questions`. The supervisor
+stays alive with `status=waiting for user input`, polling every 60 seconds without starting
+model cycles or repeating unchanged status documentation. After recording new user input in
+the handoff/plan, clear that request to resume normal ownership checks and model selection.
+Malformed input requests fail closed. This wait is distinct from the STOP marker.
 The supervisor checks models in this order between cycles:
 
 1. `openai/gpt-6.1-sol` (`high` reasoning variant)
-2. `meta/muse-spark-1.3`
-3. `opencode/muse-spark-1.3-contributor-free`
+2. `openrouter/deepseek/deepseek-v4.1-flash`
 
-These IDs were verified with `opencode models` on OpenCode 1.16.2. Quota errors place
+The OpenRouter fallback was requested on 2026-10-06 and its ID verified with a refreshed
+`opencode models openrouter` catalog on OpenCode 1.18.34. OpenRouter credentials are installed;
+the model advertises tool calling and image input. Space Bunny Alpha was not present in the
+refreshed catalog and its candidate model endpoints returned 404, so it is not configured.
+Quota errors place
 the affected model on a five-hour cooldown. Sol is preferred again when its cooldown
 expires, at the next cycle boundary. If all models are cooling down, it waits and checks
 periodically. Other execution/provider failures cool down for five minutes. No credits
@@ -96,8 +119,11 @@ This machine's desktop environment initially caused CLI "Session not found" via 
 server Basic Auth settings. The shared desktop SQLite database also lacks `replacement_seq`
 for this CLI build. The supervisor clears only those server-auth variables in its child
 environment and uses `_Build/agent-loop/opencode-loop.db`, leaving desktop history intact.
-A read-only Sol CLI heartbeat returned READY successfully with this isolation. The actual
-quota-driven switch to Muse has not yet been observed.
+A read-only Sol CLI heartbeat returned READY successfully with this isolation. Current policy
+is recorded as `model_priority` in state.json when the supervisor starts. A source/policy
+update takes effect after restarting the supervisor between cycles; active runner jobs must
+finish and the Claude worker must remain running. Provider catalog/auth presence alone does
+not prove a successful quota-triggered fallback; consult actual cycle logs.
 
 Live status: `_Build/agent-loop/state.json`. Agent output: `cycle-NNNNN.jsonl` and its
 stderr log. `LOOP-LOG.md` is the cross-model handoff. A workspace lock prevents two
@@ -120,6 +146,9 @@ py -3.13 tests/AutomationHarnessTests.py
 ```
 
 These tests verify non-overlapping short/long schedules, fragmented fatal-log detection,
-nonfatal-noise handling, and the five-hour Sol → paid Muse → free Muse → Sol policy.
-The emulator's existing CTest baseline is 50/51 passing, with only the documented
+nonfatal-noise handling, and the five-hour Sol → OpenRouter DeepSeek V4.1 Flash → Sol policy.
+Two status-only cycles cause a short model cooldown and explicit next-action guidance. Only
+engine/test changes and completed build/test/fight evidence count for this liveness check;
+documentation or Git-status jobs alone do not. It is not a performance acceptance metric.
+The current emulator CTest baseline is **53/53 passing**; upstream fixed the former
 `kernel_file_system` PEEK/WAITALL failure. No automatic commits or pushes.

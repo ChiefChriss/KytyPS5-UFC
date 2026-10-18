@@ -86,7 +86,9 @@ void ValidateNativeProgram(const IR::Program& program) {
 	const auto has_shader_data_storage = present[static_cast<size_t>(Kind::ShaderData)];
 	const auto shader_data_dwords      = program.bindings.ShaderDataDwords();
 	if ((program.bindings.UsesPushData() &&
-	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
+	     IR::PushData::StartFor(program.bindings.push_data_start_dword, shader_data_dwords,
+	                           NanTrace::Active() ? NanTrace::EventPushDword : IR::PushData::DwordCount) ==
+	         IR::PushData::NoStart) ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
 	    program.bindings.memory_offset_count != buffers.size() ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||

@@ -9,6 +9,20 @@
 namespace Common {
 
 void InitializeThreads();
+// Opts the calling host thread out of Windows power throttling (EcoQoS) so a background
+// game window does not move emulator threads to efficiency cores; no-op elsewhere or with
+// KYTY_UFC_POWER_THROTTLING=1.
+void OptOutThreadPowerThrottling();
+// Pins the calling host thread to the performance cores on hybrid CPUs (Windows); no-op elsewhere
+// or with KYTY_UFC_PIN_GPU=0.
+void PinThreadToPerformanceCores(const char* role);
+// KYTY_UFC_GPU_PRIORITY=1 (opt-in, Windows): guest threads run in a host priority band at or below
+// THREAD_PRIORITY_NORMAL (core-pinned workers one step lower) and the GPU command thread runs at
+// THREAD_PRIORITY_ABOVE_NORMAL, so spinning guest job workers cannot starve the command processor.
+[[nodiscard]] bool UfcGpuPriorityEnabled();
+// Raises the calling host thread to THREAD_PRIORITY_ABOVE_NORMAL when UfcGpuPriorityEnabled();
+// no-op otherwise and on non-Windows hosts.
+void RaiseThreadAboveGuest(const char* role);
 
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();

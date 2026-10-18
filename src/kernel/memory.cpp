@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <map>
 #include <memory>
@@ -3832,6 +3833,28 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 		EXIT("memory-protection range is not fully mapped: addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     "\n",
 		     aligned_addr, aligned_len);
+	}
+	// The host protection below replaces the GPU memory tracker's write/read watches on these
+	// pages: later CPU writes would no longer fault and GPU copies could stay stale. Report it, and
+	// with KYTY_UFC_MPROTECT_INVALIDATE=1 treat GPU-mapped parts as CPU-written first.
+	if (g_gpu_resources != nullptr) {
+		static const bool invalidate = [] {
+			const char* value = std::getenv("KYTY_UFC_MPROTECT_INVALIDATE"); // Dev 094 all-on bisect: on by default, =0 turns it off
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		const auto gpu_bytes =
+		    GetGpuResources().InvalidateMappedOverlap(aligned_addr, aligned_len, invalidate);
+		if (gpu_bytes != 0) {
+			static std::atomic<uint64_t> calls {0};
+			const auto                   call = ++calls;
+			if (call <= 64 || (call & 255u) == 0) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Guest mprotect over GPU-mapped memory #{}: addr=0x{:x} size=0x{:x} "
+				    "gpu_bytes=0x{:x} prot=0x{:x}{}\n",
+				    call, aligned_addr, aligned_len, gpu_bytes, prot,
+				    invalidate ? " (invalidated)" : ""));
+			}
+		}
 	}
 	const auto old_mode = static_cast<VirtualMemory::Mode>(
 	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));

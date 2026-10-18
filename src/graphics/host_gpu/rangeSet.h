@@ -6,8 +6,34 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <vector>
 
 namespace Libs::Graphics {
+
+// Sorts [address, address + size) entries by address and coalesces overlapping or adjacent ones
+// in place. Used by the BDA dirty-log fast path to turn unordered dirty/registered ranges into a
+// single ordered list that a buffer cursor can walk without a tree search per range.
+template <typename Range>
+void CoalesceRanges(std::vector<Range>& ranges) {
+	std::sort(ranges.begin(), ranges.end(),
+	          [](const Range& a, const Range& b) { return a.address < b.address; });
+	size_t out = 0;
+	for (const auto& range: ranges) {
+		if (out != 0) {
+			auto&      last      = ranges[out - 1];
+			const auto last_end  = last.address + last.size;
+			const auto range_end = range.address + range.size;
+			if (range.address <= last_end) {
+				if (range_end > last_end) {
+					last.size = range_end - last.address;
+				}
+				continue;
+			}
+		}
+		ranges[out++] = range;
+	}
+	ranges.resize(out);
+}
 
 class RangeSet final {
 public:

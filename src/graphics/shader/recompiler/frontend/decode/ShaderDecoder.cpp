@@ -407,7 +407,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.instructions.reserve(code.size());
 	program.code = code;
 
-	std::vector<bool> branch_targets;
+	uint32_t furthest_branch_target = 0;
 	for (uint32_t word_index = 0; word_index < code.size();) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
@@ -417,13 +417,18 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 
 		if (IsDirectBranch(inst.opcode)) {
 			const auto target_index = inst.branch_target / sizeof(uint32_t);
-			if (branch_targets.empty()) {
-				branch_targets.resize(code.size());
+			// The exact span end is a valid CFG exit; anything beyond it is invalid.
+			if (target_index > code.size()) {
+				EXIT("shader branch at pc 0x%08x targets outside the code span: 0x%08x",
+				     inst.pc, inst.branch_target);
 			}
-			branch_targets[target_index] = true;
+			furthest_branch_target = std::max(furthest_branch_target,
+			                                  static_cast<uint32_t>(target_index));
 		}
+		// An earlier return does not end decoding while a known forward branch still
+		// reaches later code. That later code may branch back into a tail block/loop.
 		if (inst.opcode == Opcode::S_ENDPGM &&
-		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
+		    (word_index >= code.size() || furthest_branch_target < word_index)) {
 			return;
 		}
 	}

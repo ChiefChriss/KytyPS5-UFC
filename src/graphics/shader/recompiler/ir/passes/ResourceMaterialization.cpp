@@ -145,6 +145,47 @@ struct ReadCapture {
 	std::vector<std::pair<uint64_t, uint64_t>>& ranges;
 };
 
+struct ReadRecorder {
+	SrtRuntime  inner;
+	SrtReadLog* log = nullptr;
+};
+
+bool BaseRead(const SrtRuntime& runtime, bool strict, uint64_t address,
+              std::span<uint32_t> values) {
+	if (strict) {
+		return runtime.read_specialization_memory != nullptr &&
+		       runtime.read_specialization_memory(runtime.userdata, address, values);
+	}
+	if (runtime.read_memory != nullptr) {
+		return runtime.read_memory(runtime.userdata, address, values);
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
+}
+
+bool RecordRead(void* userdata, bool strict, uint64_t address, std::span<uint32_t> values) {
+	auto&      recorder = *static_cast<ReadRecorder*>(userdata);
+	const bool ok       = BaseRead(recorder.inner, strict, address, values);
+	auto&      log      = *recorder.log;
+	log.records.push_back({.address = address,
+	                       .first   = static_cast<uint32_t>(log.values.size()),
+	                       .count   = static_cast<uint32_t>(values.size()),
+	                       .strict  = strict,
+	                       .ok      = ok});
+	if (ok) {
+		log.values.insert(log.values.end(), values.begin(), values.end());
+	}
+	return ok;
+}
+
+bool RecordStrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	return RecordRead(userdata, true, address, values);
+}
+
+bool RecordOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	return RecordRead(userdata, false, address, values);
+}
+
 bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
 	if (!capture.source.read_specialization_memory(capture.source.userdata, address, values)) {
@@ -947,11 +988,50 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+bool ReplaySrtReads(const SrtRuntime& runtime, const SrtReadLog& log, uint64_t& replayed) {
+	std::array<uint32_t, 8> small {};
+	std::vector<uint32_t>   large;
+	for (const auto& record: log.records) {
+		++replayed;
+		std::span<uint32_t> values;
+		if (record.count <= small.size()) {
+			values = std::span(small).first(record.count);
+		} else {
+			large.resize(record.count);
+			values = large;
+		}
+		const bool ok = BaseRead(runtime, record.strict, record.address, values);
+		if (ok != record.ok) {
+			return false;
+		}
+		if (ok && !std::equal(values.begin(), values.end(), log.values.begin() + record.first)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& source_runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          SrtReadLog* log) {
 	if (!program.resource_tracking_complete ||
-	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
+	    (program.requires_specialization_memory &&
+	     source_runtime.read_specialization_memory == nullptr)) {
 		return false;
+	}
+	// Optional read log: route every base read through a recorder. Reader nullness is kept,
+	// because the walker treats a missing strict reader specially.
+	ReadRecorder recorder {source_runtime, log};
+	SrtRuntime   runtime = source_runtime;
+	if (log != nullptr) {
+		log->records.clear();
+		log->values.clear();
+		log->user_data_mask      = 0;
+		runtime.user_data_reads = &log->user_data_mask;
+		runtime.userdata    = &recorder;
+		runtime.read_memory = RecordOrdinaryRead;
+		runtime.read_specialization_memory =
+		    source_runtime.read_specialization_memory != nullptr ? RecordStrictRead : nullptr;
 	}
 	const bool capture_reads = program.capture_specialization_reads;
 	auto& reads = snapshot.specialization_reads;

@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -1327,6 +1328,7 @@ KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 
 KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	KYTY_PROFILER_FUNCTION();
+	const ScopedFaultSite fault_site(WaitSite::IndirectReadFault);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
@@ -1636,6 +1638,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	KYTY_PROFILER_FUNCTION();
+	const ScopedFaultSite fault_site(WaitSite::IndirectReadFault);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0032400 && cmd_id != 0xc0032500);
 
@@ -1643,6 +1646,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	const auto draw_initiator = buffer[3];
 	const bool indexed        = (cmd_id == 0xc0032500);
 
+	cp.SetIndirectOffsetLocs(buffer[1], buffer[2]);
 	cp.DrawIndirect(data_offset, draw_initiator, indexed);
 
 	return 4;
@@ -1650,6 +1654,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	KYTY_PROFILER_FUNCTION();
+	const ScopedFaultSite fault_site(WaitSite::IndirectReadFault);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0082c00 && cmd_id != 0xc0083800);
 
@@ -1666,6 +1671,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 		count_addr = nullptr;
 	}
 
+	cp.SetIndirectOffsetLocs(buffer[1], buffer[2]);
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
 	                     draw_initiator, indexed);
 

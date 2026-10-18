@@ -176,6 +176,18 @@ add_custom_target(KytyGitVersion
 add_library(kyty_git_version INTERFACE)
 add_dependencies(kyty_git_version KytyGitVersion)
 
+add_custom_target(KytyShaderCacheVersion
+	COMMAND ${CMAKE_COMMAND}
+		"-DSOURCE_ROOT=${KYTY_SOURCE_DIR}"
+		"-DOUTPUT_FILE=${PROJECT_BINARY_DIR}/shaderCacheVersion.h"
+		"-DCOMPILER_ID=${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}"
+		"-DBUILD_TYPE=${CMAKE_BUILD_TYPE}-${CMAKE_CXX_FLAGS}-${CMAKE_CXX_FLAGS_RELEASE}"
+		-P "${KYTY_SOURCE_DIR}/shader_cache_version.cmake"
+	BYPRODUCTS "${PROJECT_BINARY_DIR}/shaderCacheVersion.h"
+	COMMENT "Fingerprint shader cache sources and ABI"
+	VERBATIM)
+add_dependencies(KytyGitVersion KytyShaderCacheVersion)
+
 if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
 	list(APPEND KYTY_IWYU
 		kyty_emulator
@@ -295,6 +307,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(dcc_clear_check_shader_source "${gpu_tiler_shader_dir}/dcc_clear_check.comp")
+set(dcc_clear_check_shader_spv "${gpu_tiler_generated_dir}/dcc_clear_check.spv")
+set(dcc_clear_check_shader_header "${gpu_tiler_generated_dir}/dcc_clear_check_spv.h")
+add_custom_command(
+	OUTPUT "${dcc_clear_check_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${dcc_clear_check_shader_spv}" "${dcc_clear_check_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${dcc_clear_check_shader_spv} -DOUTPUT=${dcc_clear_check_shader_header}
+	        -DSYMBOL=DCC_CLEAR_CHECK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${dcc_clear_check_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${dcc_clear_check_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -472,6 +499,17 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(resource_tracking_tests fmt::fmt Tracy::TracyClient)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
+target_sources(resource_tracking_tests PRIVATE
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderDiskCache.cpp")
+target_link_libraries(resource_tracking_tests xxhash)
+add_dependencies(resource_tracking_tests KytyShaderCacheVersion)
+
+# These focused targets compile the SRT walker without the full emulator object library.
+foreach(srt_target scalar_provenance_tests resource_materialization_tests resource_tracking_tests)
+	target_sources(${srt_target} PRIVATE
+		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNative.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNativeMemory.cpp")
+endforeach()
 
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
@@ -619,6 +657,7 @@ if(BUILD_TESTING)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME buffer_cache_async_readback COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-readback-only)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
@@ -659,6 +698,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
 	add_test(NAME host_image_allocation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --host-image-allocation-only)
+	add_test(NAME host_image_pool
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-pool-only)
 	add_test(NAME texture_cache_image_views
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
 	add_test(NAME texture_cache_storage_sampled
@@ -669,6 +710,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	set_tests_properties(buffer_cache_dirty_gc PROPERTIES ENVIRONMENT "KYTY_READBACK_WINDOW_KB=512")
+	add_test(NAME buffer_cache_dirty_gc_wide
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	set_tests_properties(buffer_cache_dirty_gc_wide PROPERTIES ENVIRONMENT "KYTY_READBACK_WINDOW_KB=4096")
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
@@ -680,6 +725,16 @@ if(BUILD_TESTING)
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 		add_test(NAME buffer_cache_ranges
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
+		# Same fixture with the opt-in merged fast path: proves the coalesced cursor walk uploads
+		# exactly the same BDA ranges as the per-range path.
+		add_test(NAME buffer_cache_ranges_merge
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
+		set_tests_properties(buffer_cache_ranges_merge PROPERTIES
+			ENVIRONMENT "KYTY_UFC_BDA_SYNC_MERGE=1")
+		add_test(NAME buffer_cache_bda_generation
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-generation-only)
+		set_tests_properties(buffer_cache_bda_generation PROPERTIES
+			ENVIRONMENT "KYTY_UFC_BDA_SYNC_GENERATION=1;KYTY_UFC_BDA_DIRTY_LOG=1;KYTY_UFC_BDA_SYNC_VERIFY=0")
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
@@ -687,6 +742,7 @@ if(BUILD_TESTING)
 		shader_cfg_tests
 		scalar_provenance_tests
 		image_page_table_tests
+		texture_mip_trim_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests
@@ -732,6 +788,21 @@ endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
+
+# Link-time optimization of the emulator target in Release builds (ported from Jetsku's fork).
+# With clang-cl CMake compiles with -flto=thin and lld-link performs ThinLTO at link time; the
+# static libraries linked into the emulator stay native objects. Build-Windows.ps1 turns it on
+# (KYTY_BUILD_IPO=0 turns it off there).
+option(KYTY_EMULATOR_IPO "Enable release interprocedural optimization (LTO) for the emulator target" OFF)
+if(KYTY_EMULATOR_IPO)
+	include(CheckIPOSupported)
+	check_ipo_supported(RESULT kyty_ipo_supported OUTPUT kyty_ipo_output LANGUAGES C CXX)
+	if(NOT kyty_ipo_supported)
+		message(FATAL_ERROR "KYTY_EMULATOR_IPO=ON but IPO/LTO is not supported here: ${kyty_ipo_output}")
+	endif()
+	set_property(TARGET kyty_emulator PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+	message(STATUS "kyty_emulator: interprocedural optimization (LTO) enabled for Release")
+endif()
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)
