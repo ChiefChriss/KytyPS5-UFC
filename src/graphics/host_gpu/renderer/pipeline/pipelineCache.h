@@ -102,11 +102,22 @@ struct PipelineVertexInputState {
 	bool operator==(const PipelineVertexInputState&) const = default;
 };
 
+// Content hash of one SPIR-V module (XXH3-128 of its words).
+struct SpirvModuleId {
+	uint64_t lo = 0;
+	uint64_t hi = 0;
+
+	[[nodiscard]] static SpirvModuleId Of(std::span<const uint32_t> words);
+	[[nodiscard]] bool                 Valid() const { return lo != 0 || hi != 0; }
+	bool                               operator==(const SpirvModuleId&) const = default;
+};
+
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
 	uint32_t         spirv_words = 0;
 	uint64_t         hash        = 0;
+	SpirvModuleId    spirv;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
@@ -147,11 +158,21 @@ struct GraphicsPipelineBuild {
 	vk::GraphicsPipelineCreateInfo                                        pipeline_info {};
 	uint64_t                                                              vs_hash = 0;
 	uint64_t                                                              ps_hash = 0;
+	// What the pipeline layout was created from, and each stage's SPIR-V identity, so the
+	// pipeline can be described as a prewarm recipe (pipelinePrewarm.h).
+	std::vector<vk::DescriptorSetLayoutBinding>                           descriptor_bindings;
+	vk::ShaderStageFlags                                                  push_constant_stages {};
+	bool                                                                  push_descriptors = false;
+	bool                                                                  uses_bindless    = false;
+	std::array<SpirvModuleId, 4>                                          stage_modules {};
+	std::vector<uint32_t>                                                 tess_control_words;
+	std::vector<uint32_t>                                                 tess_eval_words;
 };
 
 // A graphics pipeline a worker thread compiles (see PipelineCache::TryGetGraphicsPipeline).
 struct PendingGraphicsPipeline;
 class PipelineCompiler;
+class PipelinePrewarm;
 
 // The owning renderer serializes access, including saves while the GPU is running.
 // Whether every color target the draw writes is at most KYTY_SMALL_TARGET_SYNC pixels wide and
@@ -271,6 +292,7 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
+	std::unique_ptr<PipelinePrewarm>                        m_prewarm;
 	uint64_t                                                m_deferred_draws = 0;
 
 	void InitializeDriverCache();
@@ -308,9 +330,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
                             vk::PipelineCache                      driver_cache);
+// With `prewarm`, a compute pipeline whose recipe was prebuilt is taken from it, and a new one is
+// recorded.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+                            const ShaderProgram& compute_program, vk::PipelineCache driver_cache,
+                            PipelinePrewarm* prewarm = nullptr);
 
 } // namespace Libs::Graphics
 

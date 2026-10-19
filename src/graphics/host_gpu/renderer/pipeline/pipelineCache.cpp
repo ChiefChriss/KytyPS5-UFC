@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -950,7 +951,8 @@ struct PipelineCache::ProgramCache {
 		    .handle         = {.id          = ++next_shader_id,
 		                       .module      = module,
 		                       .spirv_words = static_cast<uint32_t>(spirv.size()),
-		                       .hash        = options.shader_hash},
+		                       .hash        = options.shader_hash,
+		                       .spirv       = NoteModule(spirv)},
 		});
 		const auto& permutation = source.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
@@ -1566,6 +1568,15 @@ struct PipelineCache::ProgramCache {
 	bool                                                        shader_clock = false;
 	bool                                                        bindless_images = false;
 	uint64_t                                                    next_shader_id = 0;
+	// Records each new module for pipeline prewarm recipes (null when prewarm is off).
+	PipelinePrewarm*                                            prewarm = nullptr;
+	SpirvModuleId NoteModule(std::span<const uint32_t> words) {
+		const auto id = SpirvModuleId::Of(words);
+		if (prewarm != nullptr) {
+			prewarm->NoteModule(id, words);
+		}
+		return id;
+	}
 	// SPIR-V size of the last permutation compiled (for the profiler).
 	size_t                                                      last_spirv_words = 0;
 	// The shader disk cache (null when off) and its session key, built at first use.
@@ -1973,6 +1984,14 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		PipelineCacheLog("Vulkan pipelines: compiled on {} worker threads (wait {} ms)", threads,
 		                 g_pipeline_wait.count());
 	}
+	// Dumped shaders embed per-run diagnostics, so their recipes are not worth keeping.
+	if (const auto mode = PipelinePrewarm::ConfiguredMode();
+	    mode != PipelinePrewarm::Mode::Off && !Config::GraphicsDebugDumpEnabled()) {
+		if (const auto title = PipelineCacheTitleId(); !title.empty()) {
+			m_prewarm = std::make_unique<PipelinePrewarm>(m_graphics, m_driver_cache, title, mode);
+			m_program_cache->prewarm = m_prewarm.get();
+		}
+	}
 }
 
 PipelineCache::~PipelineCache() {
@@ -1990,6 +2009,9 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	// Last: it keeps the layouts the pipelines it handed out were created with.
+	m_program_cache->prewarm = nullptr;
+	m_prewarm.reset();
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -2074,6 +2096,10 @@ void PipelineCache::InitializeDriverCache() {
 
 void PipelineCache::Save() {
 	m_program_cache->FlushDisk();
+	if (m_prewarm != nullptr) {
+		m_prewarm->Stop();
+		m_prewarm->LogSummary();
+	}
 	// No worker may use the driver cache once it is destroyed below; later pipelines are
 	// compiled on the GPU thread (FinishPending).
 	if (m_compiler != nullptr) {
@@ -2667,6 +2693,26 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	auto build = PrepareGraphicsPipeline(m_graphics, *cached, rendering, key.vertex_input,
 	                                     vertex_info, ps_input_info, programs, static_params);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	if (m_prewarm != nullptr &&
+	    std::all_of(build->stage_modules.begin(),
+	                build->stage_modules.begin() + build->pipeline_info.stageCount,
+	                [](const SpirvModuleId& id) { return id.Valid(); })) {
+		if (!build->tess_control_words.empty()) {
+			m_prewarm->NoteModule(SpirvModuleId::Of(build->tess_control_words), build->tess_control_words);
+			m_prewarm->NoteModule(SpirvModuleId::Of(build->tess_eval_words), build->tess_eval_words);
+		}
+		const auto recipe = RecipeFromBuild(*build).Serialize();
+		// Prebuilt at startup: no compile on this thread and no skipped draws while it compiles.
+		if (vk::Pipeline prebuilt {};
+		    m_prewarm->Take(recipe, prebuilt, may_defer ? g_pipeline_wait : std::chrono::seconds(10))) {
+			cached->pipeline      = prebuilt;
+			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+			EXIT_IF(!inserted);
+			LogPipelineTrace("CreatePipelineInternal done (prewarmed)", vs_id, ps_id);
+			return iter->second.get();
+		}
+		m_prewarm->Record(recipe);
+	}
 	uint64_t vertex_words = 0;
 	for (const auto& program: programs.vertex) {
 		vertex_words += program.spirv_words;
@@ -2736,7 +2782,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		zone.SetText("CS 0x%016" PRIx64, hash);
 		KYTY_PROFILER_PHASE(zone, "Compute pipeline build", profiler::colors::RedA100);
 		const auto begin = std::chrono::steady_clock::now();
-		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program, m_driver_cache,
+		                       m_prewarm.get());
 		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
 	}
 
