@@ -811,6 +811,12 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    workgroup->host_subgroup_size == 64u) {
 			return EmitNativeWaveCondition(ctx, inst);
 		}
+		// A wave32 compute shader runs on a 32-lane host subgroup (the pipeline requests it), so
+		// a guest EXEC/VCC branch must also be one decision for the wave: a lane-local branch
+		// drops EXEC-cleared lanes out of loops early. This stopped UFC 5's post-title GPU hang.
+		if (ctx.state.program.stage == ShaderType::Compute && ctx.state.program.wave_size == 32u) {
+			return EmitNativeWaveCondition(ctx, inst);
+		}
 		return ctx.Arg(inst, 0);
 	}
 	// A native scalar branch makes one decision for both emulated wave halves.
