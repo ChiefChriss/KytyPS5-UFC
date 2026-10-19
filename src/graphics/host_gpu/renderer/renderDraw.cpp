@@ -392,7 +392,12 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
 	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
-	if (depth_bias_enable) {
+	// Depth bias and the stencil values are dynamic state of every graphics pipeline, so Vulkan
+	// needs them set before each draw even while the bias or the stencil test is off
+	// (VUID-vkCmdDraw-None-07848); the values are unused then.
+	if (!depth_bias_enable) {
+		vk_buffer.setDepthBias(0.0f, 0.0f, 0.0f);
+	} else {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
 		    use_front ? poly_offset.front_offset : poly_offset.back_offset;
@@ -404,7 +409,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 	}
 
 	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
-	if (depth.stencil_test_enable) {
+	{
 		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
 			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
 			vk_buffer.setStencilCompareMask(face, state.compareMask);
