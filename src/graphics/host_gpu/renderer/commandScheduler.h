@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -227,6 +228,8 @@ private:
 	std::mutex                   m_submit_mutex;
 	std::condition_variable_any  m_submit_available;
 	std::jthread                 m_submit_thread;
+	// m_submit_jobs.size(), readable without m_submit_mutex (KYTY_GPU_SPIN_US).
+	std::atomic<uint64_t>        m_submit_pending {0};
 	// Recording thread. m_threaded and m_chunk belong to the producer (the GPU thread); the queue,
 	// free list and counters to m_record_mutex; m_worker_buffer to the recording thread (read by
 	// the producer only after a drain).
@@ -239,6 +242,9 @@ private:
 	std::vector<std::unique_ptr<Chunk>> m_free_chunks;
 	uint64_t                            m_chunks_dispatched = 0;
 	uint64_t                            m_chunks_executed   = 0;
+	// Copies of the two counters, readable without m_record_mutex (KYTY_GPU_SPIN_US).
+	std::atomic<uint64_t>               m_chunks_dispatched_hint {0};
+	std::atomic<uint64_t>               m_chunks_executed_hint {0};
 	uint64_t                            m_drains            = 0;
 	vk::CommandBuffer                   m_worker_buffer     = nullptr;
 	uint64_t                            m_record_report_buffers = 0;

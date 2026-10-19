@@ -128,4 +128,32 @@ void PreferPerformanceCores(const char* /*name*/) {}
 
 #endif
 
+void RaiseGpuThreadPriority(const char* name) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const bool ok = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
+	LOGF("CPU: %s runs at the highest thread priority%s\n", name, ok ? "" : " - failed");
+#else
+	(void)name;
+#endif
+}
+
+uint32_t GpuHandoffSpinMicros() {
+	static const uint32_t micros = [] {
+		const char* value = std::getenv("KYTY_GPU_SPIN_US");
+		if (value == nullptr) {
+			return 0ul;
+		}
+		// Capped at 10 ms: past that the thread should sleep.
+		return std::min(std::strtoul(value, nullptr, 10), 10000ul);
+	}();
+	return micros;
+}
+
 } // namespace Common

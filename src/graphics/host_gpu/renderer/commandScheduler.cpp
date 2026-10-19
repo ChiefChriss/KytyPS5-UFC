@@ -523,6 +523,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		job.tick = m_master.NextTick();
 		job.submit.AddSignal(m_master.Handle(), job.tick);
 		m_submit_jobs.push_back(job);
+		m_submit_pending.fetch_add(1, std::memory_order_release);
 	}
 	m_submit_available.notify_one();
 	return job.tick;
@@ -579,8 +580,16 @@ void CommandScheduler::EnableAsyncSubmit() {
 
 void CommandScheduler::SubmitThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuQueueSubmit");
+	Common::RaiseGpuThreadPriority("Vulkan submission thread");
+	const auto spin = Common::GpuHandoffSpinMicros();
 	for (;;) {
 		SubmitJob job;
+		(void)Common::SpinUntil(
+		    [this, &stop] {
+			    return m_submit_pending.load(std::memory_order_acquire) != 0 ||
+			           stop.stop_requested();
+		    },
+		    spin);
 		{
 			std::unique_lock lock(m_submit_mutex);
 			// A stop request still submits the queued jobs: their ticks may already be waited on.
@@ -589,6 +598,7 @@ void CommandScheduler::SubmitThread(std::stop_token stop) {
 			}
 			job = m_submit_jobs.front();
 			m_submit_jobs.pop_front();
+			m_submit_pending.fetch_sub(1, std::memory_order_relaxed);
 		}
 		QueueSubmit(job);
 	}
@@ -644,6 +654,7 @@ void CommandScheduler::DispatchChunk() {
 		std::lock_guard lock(m_record_mutex);
 		m_record_queue.push_back(std::move(m_chunk));
 		m_chunks_dispatched++;
+		m_chunks_dispatched_hint.store(m_chunks_dispatched, std::memory_order_release);
 	}
 	m_record_available.notify_one();
 }
@@ -654,6 +665,14 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 	}
 	KYTY_PROFILER_FUNCTION();
 	DispatchChunk();
+	// The GPU thread stalls here: with KYTY_GPU_SPIN_US it spins for the recording thread to catch
+	// up instead of sleeping until it is woken.
+	(void)Common::SpinUntil(
+	    [this] {
+		    return m_chunks_executed_hint.load(std::memory_order_acquire) ==
+		           m_chunks_dispatched_hint.load(std::memory_order_relaxed);
+	    },
+	    Common::GpuHandoffSpinMicros());
 	std::unique_lock lock(m_record_mutex);
 	m_drains++;
 	Profiler::Add(Profiler::Counter::RecordingDrains);
@@ -671,11 +690,20 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 void CommandScheduler::RecordingThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuRecord");
 	Common::PreferPerformanceCores("Vulkan recording thread");
+	Common::RaiseGpuThreadPriority("Vulkan recording thread");
+	const auto spin = Common::GpuHandoffSpinMicros();
 	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
 	// recycled only after the next two have run.
 	std::deque<std::unique_ptr<Chunk>> retained;
 	for (;;) {
 		std::unique_ptr<Chunk> chunk;
+		(void)Common::SpinUntil(
+		    [this, &stop] {
+			    return m_chunks_dispatched_hint.load(std::memory_order_acquire) !=
+			               m_chunks_executed_hint.load(std::memory_order_relaxed) ||
+			           stop.stop_requested();
+		    },
+		    spin);
 		{
 			std::unique_lock lock(m_record_mutex);
 			// A stop request still runs the queued chunks: their ticks may already be waited on.
@@ -706,6 +734,7 @@ void CommandScheduler::RecordingThread(std::stop_token stop) {
 				m_free_chunks.push_back(std::move(recycled));
 			}
 			m_chunks_executed++;
+			m_chunks_executed_hint.store(m_chunks_executed, std::memory_order_release);
 		}
 		m_record_executed.notify_all();
 	}
