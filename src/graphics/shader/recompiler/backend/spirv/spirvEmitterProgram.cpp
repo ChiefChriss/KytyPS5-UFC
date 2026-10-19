@@ -476,77 +476,15 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 }
 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
-	const auto ballot_type = TypeU32Vector(state, 4);
-	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
-	const auto low         = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
-	                          other_half == nullptr || half == 0 ? Def(predicate)
-	                                                             : other_half->Def(predicate));
-	if (other_half == nullptr) {
-		return low;
-	}
-	const auto high      = state.builder.AllocateId();
-	const auto low_word  = state.builder.AllocateId();
-	const auto high_word = state.builder.AllocateId();
-	const auto ballot    = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, high, scope,
-	                          half == 1 ? Def(predicate) : other_half->Def(predicate));
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low_word, low, 0);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
-	state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
-	                          ConstantU32(state, 0), ConstantU32(state, 0));
-	return ballot;
+	return state.wave->Ballot(*this, predicate);
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
-	if (other_half == nullptr) {
-		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
-		                          ConstantU32(state, spv::ScopeSubgroup), ballot);
-		return result;
-	}
-	const auto low        = state.builder.AllocateId();
-	const auto high       = state.builder.AllocateId();
-	const auto low_first  = state.builder.AllocateId();
-	const auto high_first = state.builder.AllocateId();
-	const auto low_active = state.builder.AllocateId();
-	const auto result     = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
-	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), low_first, GlslStd450(state),
-	                          GLSLstd450FindILsb, low);
-	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), high_first, GlslStd450(state),
-	                          GLSLstd450FindILsb, high);
-	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), low_active, low,
-	                          ConstantU32(state, 0));
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, low_active, low_first,
-	                          EmitAddU32(state, high_first, ConstantU32(state, 32)));
-	return result;
+	return state.wave->FirstLane(*this, ballot);
 }
 
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
-	const auto type  = TypeId(state, inst.Arg(index).GetType());
-	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
-	const auto low   = state.builder.AllocateId();
-	if (other_half == nullptr) {
-		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
-		                          lane);
-		return low;
-	}
-	const auto physical_lane =
-	    EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
-	const auto high          = state.builder.AllocateId();
-	const auto in_high       = state.builder.AllocateId();
-	const auto value         = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope,
-	                          HalfArg(inst, index, 0), physical_lane);
-	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, high, scope,
-	                          HalfArg(inst, index, 1), physical_lane);
-	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), in_high,
-	                          EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 32)),
-	                          ConstantU32(state, 0));
-	state.builder.AddFunction(spv::OpSelect, type, value, in_high, high, low);
-	return value;
+	return state.wave->Shuffle(*this, inst, index, lane);
 }
 
 uint32_t ValueEmitContext::Result(const IR::Inst& inst) {
@@ -615,7 +553,7 @@ void EmitProgram(EmitterState& state) {
 	const auto&      program = state.program;
 	ValueEmitContext ctx(state);
 	ValueEmitContext high(state);
-	if (state.lane_count == 2) {
+	if (state.wave->EmulatesHalves()) {
 		ctx.other_half  = &high;
 		high.other_half = &ctx;
 		high.half       = 1;
@@ -677,7 +615,7 @@ void EmitProgram(EmitterState& state) {
 		dispatch.continue_label     = state.builder.AllocateId();
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
-		if (state.lane_count == 2) {
+		if (state.wave->EmulatesHalves()) {
 			for (const auto& [inst, id]: dispatch.spills[0]) {
 				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
 			}
@@ -693,7 +631,7 @@ void EmitProgram(EmitterState& state) {
 			           inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMax32;
 		    })) {
 			ctx.scratch_u32_variable = state.builder.AllocateId();
-			if (state.lane_count == 2) {
+			if (state.wave->EmulatesHalves()) {
 				high.scratch_u32_variable = state.builder.AllocateId();
 			}
 			break;

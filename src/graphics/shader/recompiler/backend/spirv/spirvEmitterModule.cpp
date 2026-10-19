@@ -431,7 +431,7 @@ void DefineInputs(EmitterState& state) {
 	for (const auto& input: state.program.info.inputs) {
 		state.inputs.push_back({input});
 	}
-	if (state.lane_count == 2) {
+	if (state.wave->EmulatesHalves()) {
 		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
 		                             const char* name) {
 			if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
@@ -711,11 +711,11 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
+	if (state.wave->EmulatesHalves() || state.requirements.subgroup_ballot ||
 	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
+	if (state.wave->EmulatesHalves() || state.requirements.subgroup_ballot) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
 	if (state.requirements.subgroup_shuffle) {
@@ -764,7 +764,7 @@ void DefineModule(EmitterState& state) {
 		local_x          = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
 		local_y          = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
 		local_z          = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
-		if (state.lane_count == 2) {
+		if (state.wave->EmulatesHalves()) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;
 			if (state.requirements.compute_derivatives) {

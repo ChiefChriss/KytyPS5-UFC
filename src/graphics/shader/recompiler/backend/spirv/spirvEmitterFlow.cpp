@@ -22,7 +22,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
 	}
-	if (state.lane_count == 2 && (kind == IR::StageInputKind::LocalInvocationId ||
+	if (state.wave->EmulatesHalves() && (kind == IR::StageInputKind::LocalInvocationId ||
 	                              kind == IR::StageInputKind::GlobalInvocationId)) {
 		const auto* cs      = ShaderWorkgroupInput(state.program.stage, state.input_info);
 		uint32_t    divisor = 1;
@@ -684,52 +684,7 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto kind = inst.Flags<CFG::BranchCondition>();
-	const bool mask_zero =
-	    kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::VccZero;
-	const bool mask_nonzero =
-	    kind == CFG::BranchCondition::ExecNonZero || kind == CFG::BranchCondition::VccNonZero;
-	if (ctx.other_half == nullptr) {
-		if (ctx.state.program.stage != ShaderType::Compute || ctx.state.program.wave_size != 32 ||
-		    (!mask_zero && !mask_nonzero))
-			return ctx.Arg(inst, 0);
-		// Guest scalar mask branches choose once for the entire wave, including lanes with
-		// EXEC cleared. A lane-local branch prematurely drops those lanes out of loops.
-		const auto ballot = ctx.Ballot(inst.Arg(0));
-		const auto bits   = ctx.state.builder.AllocateId();
-		const auto result = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), bits, ballot, 0);
-		if (mask_zero) {
-			const auto active      = ctx.Ballot(IR::Value(true));
-			const auto active_bits = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), active_bits,
-			                              active, 0);
-			ctx.state.builder.AddFunction(spv::OpIEqual, TypeBool(ctx.state), result, bits,
-			                              active_bits);
-		} else {
-			ctx.state.builder.AddFunction(spv::OpINotEqual, TypeBool(ctx.state), result, bits,
-			                              ConstantU32(ctx.state, 0));
-		}
-		return result;
-	}
-	// A native scalar branch makes one decision for both emulated wave halves.
-	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
-	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
-	const auto ballot   = ctx.Ballot(inst.Arg(0));
-	const auto low      = ctx.state.builder.AllocateId();
-	const auto high     = ctx.state.builder.AllocateId();
-	const auto combined = ctx.state.builder.AllocateId();
-	const auto result   = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
-	const bool zero = kind == CFG::BranchCondition::ExecZero ||
-	                  kind == CFG::BranchCondition::VccZero ||
-	                  kind == CFG::BranchCondition::SccZero;
-	ctx.state.builder.AddFunction(zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, TypeU32(ctx.state),
-	                              combined, low, high);
-	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
-	                              result, combined, ConstantU32(ctx.state, zero ? ~0u : 0u));
-	return result;
+	return ctx.state.wave->ScalarBranchCondition(ctx, inst);
 }
 
 uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {

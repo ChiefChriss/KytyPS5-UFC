@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/NanTrace.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvWaveLowering.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -81,7 +82,8 @@ struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
 	      program(program_), input_info(input_info_),
-	      requirements(AnalyzeProgramRequirements(program_)) {}
+	      requirements(AnalyzeProgramRequirements(program_)),
+	      wave(&WaveLowering::Select(program_.wave_size, 0)) {}
 
 	Builder                                          builder;
 	const IR::Program&                               program;
@@ -105,6 +107,8 @@ struct EmitterState {
 	uint32_t                                         tess_patch_base     = 0;
 
 	const SpirvRequirements                          requirements;
+	// How guest wave operations map onto host subgroups; lane_count is its HostHalves().
+	const WaveLowering*                              wave                    = nullptr;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;

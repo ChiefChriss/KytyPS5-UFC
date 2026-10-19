@@ -173,7 +173,7 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 	}
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
-	if (state.lane_count == 2) {
+	if (state.wave->EmulatesHalves()) {
 		const auto wave_base =
 		    EmitBinaryU32(state, spv::OpBitwiseAnd, value, ConstantU32(state, ~31u));
 		return EmitAddU32(state, EmitAddU32(state, value, wave_base),
@@ -216,17 +216,7 @@ uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
 	const auto low = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, active_ballot, 0);
-	uint32_t mask = low;
-	if (state.program.wave_size == 64u) {
-		const auto high     = state.builder.AllocateId();
-		const auto in_high  = state.builder.AllocateId();
-		const auto selected = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, active_ballot, 1);
-		state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), in_high, lane,
-		                          ConstantU32(state, 32));
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, in_high, high, low);
-		mask = selected;
-	}
+	const uint32_t mask = state.wave->BallotWordForLane(state, active_ballot, lane, low);
 
 	const auto lane_low = state.builder.AllocateId();
 	const auto bit      = state.builder.AllocateId();
@@ -243,7 +233,7 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, u
 	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), active, hit,
 	                          ConstantU32(state, 0));
 	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_range, lane,
-	                          ConstantU32(state, state.program.wave_size));
+	                          ConstantU32(state, state.wave->GuestWaveSize()));
 	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), ret, active, in_range);
 	return ret;
 }

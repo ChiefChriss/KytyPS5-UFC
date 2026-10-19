@@ -7,10 +7,40 @@
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 namespace {
+
+// KYTY_UFC_SPIRV_HASH_LOG=<path> appends one line per emitted module (guest hash, stage, wave
+// size, host halves, FNV-1a of the words). Sorted logs from two builds prove a backend refactor
+// emits identical SPIR-V for the same inputs.
+void LogEmittedSpirvHash(const IR::Program& program, uint32_t lane_count,
+                         std::span<const uint32_t> words) {
+	static const char* path = std::getenv("KYTY_UFC_SPIRV_HASH_LOG");
+	if (path == nullptr || path[0] == '\0') {
+		return;
+	}
+	uint64_t hash = 0xcbf29ce484222325ull;
+	for (const auto word: words) {
+		for (uint32_t shift = 0; shift < 32; shift += 8) {
+			hash = (hash ^ ((word >> shift) & 0xffu)) * 0x100000001b3ull;
+		}
+	}
+	static std::mutex mutex;
+	std::scoped_lock  lock(mutex);
+	if (std::FILE* file = std::fopen(path, "a"); file != nullptr) {
+		std::fprintf(file, "%016" PRIx64 " stage=%u wave=%u halves=%u words=%zu spirv=%016" PRIx64 "\n",
+		             program.shader_hash, static_cast<unsigned>(program.stage), program.wave_size,
+		             lane_count, words.size(), hash);
+		std::fclose(file);
+	}
+}
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -268,12 +298,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			}
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::ConditionRef: {
-					const auto kind = inst.Flags<CFG::BranchCondition>();
-					if (program.stage == ShaderType::Compute && program.wave_size == 32 &&
-					    (kind == CFG::BranchCondition::ExecZero ||
-					     kind == CFG::BranchCondition::ExecNonZero ||
-					     kind == CFG::BranchCondition::VccZero ||
-					     kind == CFG::BranchCondition::VccNonZero)) {
+					if (WaveLowering::ScalarBranchNeedsBallot(
+					        program, inst.Flags<CFG::BranchCondition>())) {
 						requirements.subgroup_ballot = true;
 					}
 					break;
@@ -351,16 +377,17 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
 	const auto*  workgroup = ShaderWorkgroupInput(program.stage, input_info);
-	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
-	        ? 2u
-	        : 1u;
+	state.wave       = &WaveLowering::Select(program.wave_size,
+	                                         workgroup != nullptr ? workgroup->host_subgroup_size : 0u);
+	state.lane_count = state.wave->HostHalves();
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 
-	return state.builder.Build();
+	auto words = state.builder.Build();
+	LogEmittedSpirvHash(program, state.lane_count, words);
+	return words;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

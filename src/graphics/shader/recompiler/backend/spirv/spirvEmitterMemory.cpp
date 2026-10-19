@@ -14,7 +14,7 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
-	if (state.lane_count == 2) {
+	if (state.wave->EmulatesHalves()) {
 		target = Binary(state, spv::OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
 	const auto shuffled = state.builder.AllocateId();
@@ -1162,7 +1162,7 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                          Unary(state, spv::OpBitCount, TypeU32(state), high));
 	const auto first = ctx.FirstLane(ballot);
 	const auto source_lane =
-	    state.lane_count == 2
+	    state.wave->EmulatesHalves()
 	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 31))
 	        : first;
 	const auto is_first       = Binary(state, spv::OpIEqual, TypeBool(state),
@@ -1174,7 +1174,7 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto condition = AndCondition(
 	    state, is_first,
 	    AndCondition(state,
-	                 state.lane_count == 2 ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
+	                 state.wave->EmulatesHalves() ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
 	                                                ConstantU32(state, 0))
 	                                       : exec,
 	                 bounds));
