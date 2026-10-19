@@ -99,12 +99,25 @@ struct PipelineVertexInputState {
 // Shader/pipeline build cost accounting (printed with the "Shaders:" line).
 void NotePipelineBuildNs(uint64_t nanoseconds) noexcept;
 
+// Content hash of one SPIR-V module (XXH3-128 of its words).
+struct SpirvModuleId {
+	uint64_t lo = 0;
+	uint64_t hi = 0;
+
+	[[nodiscard]] static SpirvModuleId Of(std::span<const uint32_t> words);
+	[[nodiscard]] bool                 Valid() const { return lo != 0 || hi != 0; }
+	bool                               operator==(const SpirvModuleId&) const = default;
+};
+
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
+	SpirvModuleId    spirv;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
+
+class PipelinePrewarm;
 
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
@@ -183,11 +196,13 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	std::unique_ptr<PipelinePrewarm>                        m_prewarm;
 
 	void InitializeDriverCache();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+// With `prewarm`, a pipeline whose recipe was prebuilt is taken from it, and a new one is recorded.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,
@@ -195,10 +210,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache);
+                            vk::PipelineCache driver_cache, PipelinePrewarm* prewarm = nullptr);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+                            const ShaderProgram& compute_program, vk::PipelineCache driver_cache,
+                            PipelinePrewarm* prewarm = nullptr);
 
 } // namespace Libs::Graphics
 

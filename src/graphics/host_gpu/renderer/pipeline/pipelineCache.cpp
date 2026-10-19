@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelinePrewarm.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -591,7 +592,7 @@ struct PipelineCache::ProgramCache {
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(program),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id = ++next_shader_id, .module = module, .spirv = NoteModule(result.spirv)},
 		};
 	}
 
@@ -751,7 +752,7 @@ struct PipelineCache::ProgramCache {
 						const auto module = CompileSPV(spirv, device);
 						EXIT_IF(module == nullptr);
 						entry->second.permutations.push_back({slot->specialization, std::move(program),
-						    {.id = ++next_shader_id, .module = module}});
+						    {.id = ++next_shader_id, .module = module, .spirv = NoteModule(spirv)}});
 						const auto& cached = entry->second.permutations.back();
 						input_info.stage = {.program = &cached.program, .resources = &slot->resources};
 						cached.program.bindings.AdvancePushData(push_data_cursor);
@@ -852,6 +853,15 @@ struct PipelineCache::ProgramCache {
 	explicit ProgramCache(vk::Device device, vk::PhysicalDeviceProperties properties): device(device), properties(properties) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
+
+	// Content identity of a new module, recorded for pipeline prewarm recipes.
+	SpirvModuleId NoteModule(std::span<const uint32_t> spirv) {
+		const auto id = SpirvModuleId::Of(spirv);
+		if (prewarm != nullptr) {
+			prewarm->NoteModule(id, spirv);
+		}
+		return id;
+	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
@@ -868,16 +878,29 @@ struct PipelineCache::ProgramCache {
 	std::unique_ptr<ShaderDiskCache::Store>                      disk;
 	uint64_t                                                    source_hits = 0, permutation_hits = 0;
 	uint64_t                                                    next_shader_id = 0;
+	PipelinePrewarm*                                            prewarm = nullptr;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.GetPhysicalDeviceProperties())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	// Traced or dumped shaders embed per-process diagnostics, so their recipes are not reusable.
+	if (const auto mode = PipelinePrewarm::ConfiguredMode();
+	    mode != PipelinePrewarm::Mode::Off && !ShaderRecompiler::NanTrace::Active() &&
+	    !Config::GraphicsDebugDumpEnabled()) {
+		if (const auto title = PipelineCacheTitleId(); !title.empty()) {
+			m_prewarm = std::make_unique<PipelinePrewarm>(m_graphics, m_driver_cache, title, mode);
+			m_program_cache->prewarm = m_prewarm.get();
+		}
+	}
 }
 
 PipelineCache::~PipelineCache() {
 	Save();
+	// Workers stop and unclaimed prebuilt pipelines are destroyed before the driver cache goes.
+	m_program_cache->prewarm = nullptr;
+	m_prewarm.reset();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -976,6 +999,9 @@ void NotePipelineBuildNs(uint64_t nanoseconds) noexcept {
 
 void PipelineCache::Save() {
 	m_program_cache->FlushDisk();
+	if (m_prewarm != nullptr) {
+		m_prewarm->LogSummary();
+	}
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -1327,7 +1353,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
+	                       ps_input_info, programs, static_params, m_driver_cache, m_prewarm.get());
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -1355,7 +1381,8 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program, m_driver_cache,
+	                       m_prewarm.get());
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
