@@ -44,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -594,8 +595,25 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Recorder());
-		state.width               = std::min(state.width, depth.desc.info.extent.width);
-		state.height              = std::min(state.height, depth.desc.info.extent.height);
+		// The render area must stay inside the native depth image: NVIDIA faults the device on a
+		// draw past its width. TextureCache grows a depth target that outgrows its image, so a
+		// smaller image here is a cache bug; clamp rather than lose the device.
+		const uint32_t native_width =
+		    std::max(image.backing.extent.width >> view.base_level, 1u);
+		const uint32_t native_height =
+		    std::max(image.backing.extent.height >> view.base_level, 1u);
+		if (depth.desc.info.extent.width > native_width ||
+		    depth.desc.info.extent.height > native_height) {
+			static std::atomic_bool warned {false};
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Warning: depth target {}x{} exceeds its image {}x{}; clamping render area\n",
+				    depth.desc.info.extent.width, depth.desc.info.extent.height, native_width,
+				    native_height));
+			}
+		}
+		state.width  = std::min({state.width, depth.desc.info.extent.width, native_width});
+		state.height = std::min({state.height, depth.desc.info.extent.height, native_height});
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
