@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -294,8 +295,13 @@ private:
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	std::unique_ptr<PipelinePrewarm>                        m_prewarm;
 	uint64_t                                                m_deferred_draws = 0;
+	// Writes the driver cache every minute while it grows, so a crash keeps its pipelines.
+	std::jthread                                            m_save_thread;
+	size_t                                                  m_saved_cache_size = 0;
 
 	void InitializeDriverCache();
+	// Writes the driver cache to m_driver_cache_path; false if nothing was written.
+	bool WriteDriverCache();
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
 };

@@ -2092,9 +2092,35 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+	// The cache used to be written only on a clean exit, so a crash or a killed run lost every
+	// pipeline compiled in it. Write it every minute from here instead, when it has grown; the
+	// GPU thread never waits for the write. Vulkan pipeline caches are internally synchronized,
+	// so reading the data while pipelines are created is allowed.
+	(void)m_graphics.device.getPipelineCacheData(m_driver_cache, &m_saved_cache_size, nullptr);
+	m_save_thread = std::jthread([this](const std::stop_token& stop) {
+		constexpr auto Period = std::chrono::seconds(60);
+		auto           next   = std::chrono::steady_clock::now() + Period;
+		while (!stop.stop_requested()) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			if (std::chrono::steady_clock::now() < next) {
+				continue;
+			}
+			next        = std::chrono::steady_clock::now() + Period;
+			size_t size = 0;
+			if (m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr) ==
+			        vk::Result::eSuccess &&
+			    size != m_saved_cache_size) {
+				(void)WriteDriverCache();
+			}
+		}
+	});
 }
 
 void PipelineCache::Save() {
+	if (m_save_thread.joinable()) {
+		m_save_thread.request_stop();
+		m_save_thread.join();
+	}
 	m_program_cache->FlushDisk();
 	if (m_prewarm != nullptr) {
 		m_prewarm->Stop();
@@ -2108,7 +2134,12 @@ void PipelineCache::Save() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	(void)WriteDriverCache();
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	m_driver_cache = nullptr;
+}
 
+bool PipelineCache::WriteDriverCache() {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -2129,7 +2160,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -2137,7 +2168,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -2154,12 +2185,12 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	m_saved_cache_size = payload.size();
+	return true;
 }
 
 // Glyphs, icons and other cached layers are drawn once into small offscreen targets, and a draw
