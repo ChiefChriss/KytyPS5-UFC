@@ -504,6 +504,19 @@ void GameController::AddState() {
 void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
+	// A button press on another connected gamepad makes it the active one, so the pad being
+	// used drives player 1 (a second pad or a virtual pad for automation is otherwise ignored
+	// while the first connected one stays active).
+	if (down && id != HOST_INPUT_CONTROLLER_ID && id != m_active_id) {
+		if (const auto it = std::find(m_connected_ids.begin(), m_connected_ids.end(), id);
+		    it != m_connected_ids.end()) {
+			m_connected_ids.erase(it);
+			m_connected_ids.insert(m_connected_ids.begin(), id);
+			CheckActive();
+			LOGF("Controller %d is now the active pad\n", id);
+		}
+	}
+
 	// The keyboard shares the player-1 pad with the active gamepad.
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		m_state.time = LibKernel::KernelGetProcessTime();
