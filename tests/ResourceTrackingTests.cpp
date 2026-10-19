@@ -1433,7 +1433,7 @@ void TestUntrackableSamplerBorderWord() {
     MemoryInfo memory;
     memory.kind = ResourceKind::Image;
     memory.image_dimension = Decoder::ImageDimension::Dim2D;
-    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress(), Value(true)},
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
                  fixture.AddMemory(memory, 0x80));
     fixture.PlanAndTrack();
     // The descriptor refers to the fixture's instructions: inspect it before they are freed.
