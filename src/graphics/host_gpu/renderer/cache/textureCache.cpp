@@ -23,6 +23,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -854,10 +855,24 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
-		case BindingType::DepthTarget:
+		case BindingType::DepthTarget: {
 			recreate |= !cached.info.IsDepth();
 			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
+			// The overlap match compares pitch, not width: a wider target within the same 64 KiB
+			// tile pitch (dynamic resolution) would bind the narrower image, and the render area,
+			// taken from the guest extent, would rasterize past its edge (NVIDIA "3D WIDTH ZT
+			// Violation", device lost). A depth attachment cannot grow, so recreate it.
+			const bool grows = requested.extent.width > cached.info.extent.width ||
+			                   requested.extent.height > cached.info.extent.height;
+			if (grows && !recreate) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "TextureCache: depth target 0x{:x} grows {}x{} -> {}x{}\n",
+				    requested.data.address, cached.info.extent.width, cached.info.extent.height,
+				    requested.extent.width, requested.extent.height));
+			}
+			recreate |= grows;
 			break;
+		}
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
 	if (!recreate) {
