@@ -5,13 +5,10 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
-#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
-#include "graphics/host_gpu/renderer/gpuCrashDiagnostics.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -20,20 +17,15 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_scheduler(scheduler), m_graphics(scheduler.Graphics()) {}
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
 bool CommandBuffer::IsInvalid() const {
-	return !m_open;
+	return m_buffer == nullptr;
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
-	return m_scheduler.Threaded() ? m_scheduler.DrainRecording() : m_buffer;
-}
-
-CommandRecorder CommandBuffer::Recorder() const {
-	EXIT_IF(IsInvalid());
-	return {m_scheduler, m_buffer};
+	return m_buffer;
 }
 
 void CommandBuffer::Begin() {
@@ -50,7 +42,6 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
-	if (m_scheduler.Threaded()) return; // Recorder owns end() immediately before its submit.
 	auto buffer = Handle();
 
 	auto result = buffer.end();
@@ -59,8 +50,7 @@ void CommandBuffer::End() const {
 }
 
 void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
-                                 uint32_t arg2, uint32_t arg3, uint64_t arg4,
-                                 const GpuCrashDiagnostics::GraphicsShaderIdentity& graphics_shaders) {
+                                 uint32_t arg2, uint32_t arg3, uint64_t arg4) {
 	m_debug_op        = op;
 	m_debug_submit_id = submit_id;
 	m_debug_arg0      = arg0;
@@ -68,35 +58,6 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
-	if ((m_graphics.checkpoints_enabled || m_graphics.buffer_markers_enabled) &&
-	    !IsInvalid()) {
-		// Checkpoints alone do not imply earlier work finished; serialize so the last
-		// bottom-of-pipe checkpoint bounds the hung command. Barriers are restricted
-		// inside dynamic rendering, so draws recorded there stay unserialized.
-		if (m_graphics.checkpoints_enabled && !m_rendering) {
-			vk::MemoryBarrier barrier {};
-			barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
-			barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-			Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-			                         vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0,
-			                         nullptr, 0, nullptr);
-		}
-		GpuCrashDiagnostics::CheckpointInfo info {};
-		info.op        = op;
-		info.submit_id = submit_id;
-		info.args[0]   = arg0;
-		info.args[1]   = arg1;
-		info.args[2]   = arg2;
-		info.args[3]   = arg3;
-		info.arg4      = arg4;
-		info.graphics  = graphics_shaders;
-		if (m_shaders != nullptr) {
-			info.ps_addr = m_shaders->GetPs().ps_regs.data_addr;
-			info.es_addr = m_shaders->GetVs().es_regs.data_addr;
-			info.gs_addr = m_shaders->GetVs().gs_regs.data_addr;
-		}
-		GpuCrashDiagnostics::RecordCheckpoint(m_graphics, Recorder(), info);
-	}
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
@@ -142,7 +103,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Recorder().beginRendering(rendering);
+	Handle().beginRendering(rendering);
 	m_render_state = state;
 	m_rendering    = true;
 }
@@ -151,7 +112,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	Recorder().endRendering();
+	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
 }

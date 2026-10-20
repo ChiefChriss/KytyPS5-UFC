@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
@@ -13,6 +14,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
@@ -24,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,16 +89,6 @@ ThreadLocalStorage::~ThreadLocalStorage() {
 		FreeTlsBlock(&block);
 	}
 }
-
-#pragma pack(1)
-
-struct EntryParams {
-	int         argc;
-	uint32_t    pad;
-	const char* argv[3];
-};
-
-#pragma pack()
 
 using atexit_func_t = KYTY_SYSV_ABI void (*)();
 using entry_func_t  = KYTY_SYSV_ABI void (*)(EntryParams* params, atexit_func_t atexit_func);
@@ -198,6 +191,7 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -660,6 +654,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
 		return true;
 	}
 
@@ -674,6 +669,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Unknown: return false;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
 	}
@@ -1264,7 +1260,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 #endif
 
-	PreloadAdjacentPrograms();
+	// The runtime automatically loads libc; other PRXs are requested by the application.
+	const auto libc_path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
+	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
 	RelocateAll();
 
 	if (!game_patch.empty()) {
@@ -1273,16 +1271,23 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
-	StartAllModules();
+	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
+		StartModule(libc, 0, nullptr, nullptr);
+	}
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
 	if (auto entry = GetEntry(); entry != 0) {
+		const auto& arguments = Config::GetGuestArguments();
+		const auto params_size = offsetof(EntryParams, argv) +
+		                         (arguments.size() + 2) * sizeof(const char*);
 		auto* params = reinterpret_cast<EntryParams*>(
-		    (reinterpret_cast<uintptr_t>(main_stack_top) - 0x100u) & ~static_cast<uintptr_t>(0x0f));
-		std::memset(params, 0, sizeof(EntryParams));
-		params->argc    = 1;
-		params->argv[0] = "KytyEmu";
+		    (reinterpret_cast<uintptr_t>(main_stack_top) - params_size - 0x100u) &
+		    ~static_cast<uintptr_t>(0x0f));
+		std::memset(params, 0, params_size);
+		for (const auto& argument: arguments) {
+			params->argv[params->argc++] = argument.c_str();
+		}
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 
@@ -1526,84 +1531,6 @@ void RuntimeLinker::StackTrace(uint64_t frame_ptr, uint64_t stack_ptr) {
 	}
 }
 
-static std::string GetProgramModuleName(const Program* program) {
-	EXIT_IF(program == nullptr);
-
-	if (program->dynamic_info != nullptr && program->dynamic_info->so_name != nullptr &&
-	    program->dynamic_info->so_name[0] != '\0') {
-		return std::string(program->dynamic_info->so_name);
-	}
-
-	return Common::FilenameWithoutDirectory(Common::PathToGenericString(program->file_name));
-}
-
-static bool ModuleStartDependenciesSatisfied(const Program*               program,
-                                             const std::vector<Program*>& programs,
-                                             const std::vector<Program*>& started) {
-	EXIT_IF(program == nullptr);
-	EXIT_IF(program->dynamic_info == nullptr);
-
-	for (const auto* needed: program->dynamic_info->needed) {
-		if (needed == nullptr || needed[0] == '\0') {
-			continue;
-		}
-
-		const auto needed_name = std::string(needed);
-
-		for (auto* dependency: programs) {
-			if (dependency == nullptr || dependency == program || dependency->elf == nullptr ||
-			    !dependency->elf->IsShared()) {
-				continue;
-			}
-
-			const auto dependency_name = GetProgramModuleName(dependency);
-			if (Common::EqualNoCase(dependency_name, needed_name) ||
-			    Common::EqualNoCase(Common::FilenameWithoutDirectory(
-			                            Common::PathToGenericString(dependency->file_name)),
-			                        needed_name)) {
-				if (std::find(started.begin(), started.end(), dependency) == started.end()) {
-					return false;
-				}
-				break;
-			}
-		}
-	}
-
-	return true;
-}
-
-void RuntimeLinker::StartAllModules() {
-	Common::LockGuard lock(m_mutex);
-
-	std::vector<Program*> started;
-
-	for (;;) {
-		bool progressed = false;
-
-		for (auto* p: m_programs) {
-			if (p->elf->IsShared() && p->dynamic_info->init_vaddr != 0 &&
-			    std::find(started.begin(), started.end(), p) == started.end() &&
-			    ModuleStartDependenciesSatisfied(p, m_programs, started)) {
-				StartModule(p, 0, nullptr, nullptr);
-				started.push_back(p);
-				progressed = true;
-			}
-		}
-
-		if (!progressed) {
-			break;
-		}
-	}
-
-	for (auto* p: m_programs) {
-		if (p->elf->IsShared() && p->dynamic_info->init_vaddr != 0 &&
-		    std::find(started.begin(), started.end(), p) == started.end()) {
-			StartModule(p, 0, nullptr, nullptr);
-			started.push_back(p);
-		}
-	}
-}
-
 void RuntimeLinker::StopAllModules() {
 	Common::LockGuard lock(m_mutex);
 
@@ -1611,75 +1538,6 @@ void RuntimeLinker::StopAllModules() {
 		if (p->elf->IsShared() && p->dynamic_info->fini_vaddr != 0) {
 			StopModule(p, 0, nullptr, nullptr);
 		}
-	}
-}
-
-static bool IsAdjacentModuleFile(const std::string& name) {
-	auto lower = Common::ToLower(name);
-	return lower.ends_with(".prx") || lower.ends_with(".sprx");
-}
-
-static bool SkipAdjacentModuleFile(const std::string& name) {
-	auto lower = Common::ToLower(name);
-	return lower == "eboot.bin" || lower == "libkernel.prx" || lower == "libkernel_sys.prx";
-}
-
-void RuntimeLinker::PreloadAdjacentPrograms() {
-	if (m_programs.empty()) {
-		return;
-	}
-
-	std::vector<std::filesystem::path> module_paths;
-
-	auto is_loaded = [this](const std::filesystem::path& path) {
-		auto fixed_path = Common::FixFilenameSlash(Common::PathToGenericString(path));
-		for (auto* program: m_programs) {
-			if (Common::EqualNoCase(
-			        Common::FixFilenameSlash(Common::PathToGenericString(program->file_name)),
-			        fixed_path)) {
-				return true;
-			}
-		}
-		return false;
-	};
-
-	auto add_path = [&module_paths, &is_loaded](const std::filesystem::path& path) {
-		if (is_loaded(path)) {
-			return;
-		}
-		for (const auto& p: module_paths) {
-			if (Common::EqualNoCase(Common::PathToGenericString(p),
-			                        Common::PathToGenericString(path))) {
-				return;
-			}
-		}
-		module_paths.push_back(path);
-	};
-
-	auto add_dir = [&add_path](const std::filesystem::path& dir) {
-		if (!Common::File::IsDirectoryExisting(dir)) {
-			return;
-		}
-		for (const auto& entry: Common::File::GetDirEntries(dir)) {
-			if (entry.is_file && IsAdjacentModuleFile(entry.name) &&
-			    !SkipAdjacentModuleFile(entry.name)) {
-				add_path(dir / entry.name);
-			}
-		}
-	};
-
-	auto root = m_programs.at(0)->file_name.parent_path();
-	if (root.empty()) {
-		return;
-	}
-
-	add_dir(root);
-	add_dir(root / "sce_module");
-	add_dir(root / "sce_modules");
-
-	for (const auto& path: module_paths) {
-		auto* program                        = LoadProgram(path);
-		program->fail_if_global_not_resolved = false;
 	}
 }
 
@@ -1812,11 +1670,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
-#if !defined(__APPLE__)
 	const bool emulate_amd = Config::AmdCpuEnabled();
-#else
-	const bool emulate_amd = false;
-#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
 #else
@@ -2098,12 +1952,6 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->debug != 0);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->textrel != 0);
-
-	std::vector<uint64_t> needed;
-	GetDynValues(elf, &needed, DT_NEEDED);
-	for (auto need: needed) {
-		program->dynamic_info->needed.push_back(program->dynamic_info->str_table + need);
-	}
 
 	uint64_t so_name = 0;
 	GetDynValue(elf, &so_name, DT_SONAME);

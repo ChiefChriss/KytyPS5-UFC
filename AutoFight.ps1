@@ -32,10 +32,22 @@ param(
     [bool]$KeepDisplayOn = $true,
     # PrintWindow cannot read this Vulkan window's client area; capture the composited screen
     # region instead (requires the window to be visible, which KeepDisplayOn/topmost ensures).
-    [bool]$ScreenCapture = $true
+    [bool]$ScreenCapture = $true,
+    # Copied over the build's _SaveData before launch, so every build (a new one has none) starts
+    # past UFC 5's first-run setup and without post-fight progress; see _golden-save\README.txt.
+    [string]$SaveTemplate = (Join-Path $PSScriptRoot '_Build\autolab\_golden-save\_SaveData'),
+    # Run with the build's own _SaveData instead (manual sessions, save-related bugs).
+    [switch]$KeepSaveData
 )
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+# _Build\autolab\STOP: a run was cancelled by hand (Ctrl+C, or the game closed). No game starts
+# until someone deletes it, so no loop calling this script keeps launching games after a cancel.
+$stopFile = Join-Path $root '_Build\autolab\STOP'
+if (Test-Path -LiteralPath $stopFile) {
+    Write-Warning "AutoFight: not starting: $stopFile exists ($(Get-Content -LiteralPath $stopFile -TotalCount 1)). Delete it to run again."
+    exit 3
+}
 # A previous emulator that is still exiting holds ~14 GiB of reserved guest address space, and a
 # new launch then fails with "failed to reserve guest address space". Wait for it to go away.
 for ($w = 0; $w -lt 90 -and (Get-Process -Name kyty_emulator -ErrorAction SilentlyContinue); $w++) { Start-Sleep -Seconds 1 }
@@ -45,6 +57,25 @@ New-Item -ItemType Directory -Path $session -Force | Out-Null
 $emu = $Emulator
 if (-not (Test-Path -LiteralPath $emu)) { throw "Emulator not found: $emu (run Build-Windows.ps1)" }
 if (-not (Test-Path -LiteralPath (Join-Path $GameDir 'eboot.bin'))) { throw "No eboot.bin in $GameDir" }
+
+# The emulator keeps _SaveData next to its exe (it runs with that working directory). The build's
+# own save is renamed, never deleted: it may hold someone's real progress.
+$saveSeed = 'kept'
+if (-not $KeepSaveData) {
+    if (Test-Path -LiteralPath (Join-Path $SaveTemplate 'PPSA03541')) {
+        $saveDir = Join-Path (Split-Path $emu) '_SaveData'
+        if (Test-Path -LiteralPath $saveDir) {
+            $backup = '_SaveData.autofight-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            Rename-Item -LiteralPath $saveDir -NewName $backup
+            Write-Host "AutoFight: moved the build's save to $backup"
+        }
+        Copy-Item -LiteralPath $SaveTemplate -Destination $saveDir -Recurse
+        $saveSeed = $SaveTemplate
+    } else {
+        Write-Warning "AutoFight: no golden save at $SaveTemplate; a new build starts at UFC 5's first-run setup"
+        $saveSeed = 'missing-template'
+    }
+}
 
 Add-Type @"
 using System;
@@ -278,6 +309,9 @@ $log = Join-Path $session 'console.log'
 $errLog = Join-Path $session 'stderr.log'
 $launchEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
 $launchTime = Get-Date
+$monitorDone = $false
+$monitorFailed = $false
+try {
 $p = Start-Process -FilePath $emu -ArgumentList $argLine -WorkingDirectory (Split-Path $emu) `
     -RedirectStandardOutput $log -RedirectStandardError $errLog -PassThru
 $null = $p.Handle
@@ -391,9 +425,31 @@ while (((Get-Date) - $start).TotalSeconds -lt $MonitorSeconds) {
     "$((Get-Date).ToString('HH:mm:ss')),$elapsed,$fps,$([math]::Round($ep.CPU,1)),$rss,$gu,$gm,$bright,$frame" | Out-File $csv -Append -Encoding utf8
 }
 
+$monitorDone = $true
+} catch {
+    $monitorFailed = $true
+    throw
+} finally {
+    if (-not $monitorDone) {
+        # Ctrl+C in this window (a script error is not a cancel: the loop may go on after one).
+        if (-not $monitorFailed) {
+            "AutoFight interrupted by Ctrl+C $(Get-Date -Format s) in $session" | Out-File $stopFile -Encoding utf8
+        }
+        if ($p) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+        if ($menuProc) { Stop-Process -Id $menuProc.Id -Force -ErrorAction SilentlyContinue }
+        if ($watchProc) { Stop-Process -Id $watchProc.Id -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 $exitCode = ''
 $ep = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
 if ($ep) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } else { try { $exitCode = $p.ExitCode } catch { } }
+if ($exitReason -eq 'emulator exited' -and ($exitCode -eq -1073741510 -or $exitCode -eq 0) -and
+    -not (Select-String -LiteralPath $log -Pattern 'Fatal Error|ErrorDeviceLost' -Quiet)) {
+    $exitReason = 'cancelled by user'
+    "Run cancelled by hand $(Get-Date -Format s) in $session (exit code $exitCode)" | Out-File $stopFile -Encoding utf8
+    Write-Warning "AutoFight: the game was closed by hand; wrote $stopFile. No run starts until it is deleted."
+}
 if ($menuProc -and -not $menuProc.HasExited) { Stop-Process -Id $menuProc.Id -Force -ErrorAction SilentlyContinue }
 if ($watchProc -and -not $watchProc.HasExited) { Stop-Process -Id $watchProc.Id -Force -ErrorAction SilentlyContinue }
 if ($tracyJob) {
@@ -480,6 +536,7 @@ tracy_start_seconds=$TracyStartSeconds
 screenshot_every_sec=$ScreenshotEverySec
 shader_dump=$([bool]$ShaderDump)
 session=$session
+save_seed=$saveSeed
 exit_reason=$exitReason
 exit_code=$exitCode
 duration_s=$(if ($rows) { $rows[-1].elapsed_s } else { 0 })
@@ -510,3 +567,4 @@ $summary | Out-File (Join-Path $session 'summary.txt') -Encoding utf8
 Write-Host $summary
 Write-Host "Triage: $(Join-Path $session 'triage.md')"
 if ($KeepDisplayOn) { $null = [WinCap]::SetThreadExecutionState($ES_CONTINUOUS) }
+if ($exitReason -eq 'cancelled by user') { exit 3 }

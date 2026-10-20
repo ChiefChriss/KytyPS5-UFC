@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
 function Assert-GameClosed {
-    $busy = Get-Process -Name launcher, kyty_emulator -ErrorAction SilentlyContinue
+    $busy = Get-Process -Name launcher, kyty_launcher, kyty_emulator -ErrorAction SilentlyContinue
     if ($busy) { throw 'Launcher/emulator is active. Close only your own processes, then retry the build/install/tests.' }
 }
 Assert-GameClosed

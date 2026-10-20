@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -9,8 +10,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -18,19 +19,11 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
-#include <cstdlib>
-#include <filesystem>
+#include <atomic>
 #include <limits>
 #include <memory>
-#include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
-
-// stb_image_write is compiled TU-locally inside libPngEnc.cpp (STB_IMAGE_WRITE_STATIC), so the
-// opt-in frame dump carries its own writer here. The two definitions are independent.
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -41,6 +34,8 @@ struct Presenter::Frame {
 	vk::ImageView view         = nullptr;
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
+	bool          hdr          = false;
+	bool          blank        = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -155,319 +150,6 @@ private:
 	std::vector<Presenter::Frame*>                 m_free;
 	vk::Format                                     m_format = vk::Format::eUndefined;
 };
-
-namespace {
-
-// Opt-in presented-frame dump for unattended visual verification (the overnight desktop is
-// often not composited, so screen capture returns black). The readback copy is recorded into
-// the existing present command buffer, but completion is only *polled* later from the present
-// thread via the scheduler timeline; there is deliberately no in-present wait (the earlier
-// in-present readback stalled the command scheduler and hung the GPU).
-struct FrameDumpSettings {
-	std::string dir;
-	uint64_t    interval_ns = 2'000'000'000ull;
-	uint64_t    start_ns    = 1'000'000'000ull;
-	uint32_t    max_width   = 960;
-	bool        enabled     = false;
-};
-
-const FrameDumpSettings& GetFrameDumpSettings() {
-	static const FrameDumpSettings settings = [] {
-		FrameDumpSettings value {};
-		const char*       dir = std::getenv("KYTY_UFC_FRAME_DUMP");
-		if (dir == nullptr || dir[0] == '\0') {
-			return value;
-		}
-		value.enabled = true;
-		value.dir     = dir;
-		const auto read_u32 = [](const char* name, uint32_t fallback) {
-			const char* text = std::getenv(name);
-			return text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10))
-			                       : fallback;
-		};
-		value.interval_ns =
-		    static_cast<uint64_t>(read_u32("KYTY_UFC_FRAME_DUMP_INTERVAL_MS", 2000)) * 1'000'000ull;
-		value.start_ns =
-		    static_cast<uint64_t>(read_u32("KYTY_UFC_FRAME_DUMP_START_MS", 1000)) * 1'000'000ull;
-		value.max_width = std::max<uint32_t>(read_u32("KYTY_UFC_FRAME_DUMP_MAX_WIDTH", 960), 16u);
-		if (value.interval_ns == 0) {
-			value.interval_ns = 2'000'000'000ull;
-		}
-		std::error_code error;
-		std::filesystem::create_directories(value.dir, error);
-		return value;
-	}();
-	return settings;
-}
-
-uint32_t FrameDumpBytesPerPixel(vk::Format format) {
-	switch (format) {
-		case vk::Format::eR8G8B8A8Unorm:
-		case vk::Format::eR8G8B8A8Srgb:
-		case vk::Format::eB8G8R8A8Unorm:
-		case vk::Format::eB8G8R8A8Srgb:
-		case vk::Format::eA2R10G10B10UnormPack32:
-		case vk::Format::eA2B10G10R10UnormPack32: return 4;
-		default: return 0;
-	}
-}
-
-enum class FrameDumpPixelFormat { Unsupported, Rgba8, Bgra8, A2R10G10B10, A2B10G10R10 };
-
-FrameDumpPixelFormat ClassifyFrameDumpFormat(vk::Format format) {
-	switch (format) {
-		case vk::Format::eR8G8B8A8Unorm:
-		case vk::Format::eR8G8B8A8Srgb: return FrameDumpPixelFormat::Rgba8;
-		case vk::Format::eB8G8R8A8Unorm:
-		case vk::Format::eB8G8R8A8Srgb: return FrameDumpPixelFormat::Bgra8;
-		case vk::Format::eA2R10G10B10UnormPack32: return FrameDumpPixelFormat::A2R10G10B10;
-		case vk::Format::eA2B10G10R10UnormPack32: return FrameDumpPixelFormat::A2B10G10R10;
-		default: return FrameDumpPixelFormat::Unsupported;
-	}
-}
-
-uint64_t FrameDumpNowNs() {
-	return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-}
-
-class FrameDumper {
-public:
-	bool Enabled() const { return GetFrameDumpSettings().enabled; }
-
-	bool Due() const {
-		if (!GetFrameDumpSettings().enabled || m_pending) {
-			return false;
-		}
-		return FrameDumpNowNs() >= m_next_due_ns;
-	}
-
-	// Records the readback and the host-read barrier into the caller's command buffer. The
-	// source image must already be in eTransferSrcOptimal with eTransferRead access.
-	bool Record(vk::CommandBuffer command, const VulkanImage& source,
-	            const GraphicContext& graphics) {
-		const uint32_t bytes_per_pixel = FrameDumpBytesPerPixel(source.format);
-		const auto     pixel_format    = ClassifyFrameDumpFormat(source.format);
-		if (bytes_per_pixel == 0 || pixel_format == FrameDumpPixelFormat::Unsupported ||
-		    source.extent.width == 0 || source.extent.height == 0) {
-			if (!m_unsupported_logged) {
-				m_unsupported_logged = true;
-				Log::WriteToConsoleAndLog(fmt::format(
-				    "Frame dump: unsupported presented format {}; disabled for this run\n",
-				    static_cast<int>(source.format)));
-			}
-			m_next_due_ns = FrameDumpNowNs() + GetFrameDumpSettings().interval_ns;
-			return false;
-		}
-		const uint64_t size = static_cast<uint64_t>(source.extent.width) *
-		                      source.extent.height * bytes_per_pixel;
-		vk::BufferCreateInfo buffer_info {};
-		buffer_info.size  = size;
-		buffer_info.usage = vk::BufferUsageFlagBits::eTransferDst;
-		if (graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer) != vk::Result::eSuccess) {
-			m_buffer      = nullptr;
-			m_next_due_ns = FrameDumpNowNs() + GetFrameDumpSettings().interval_ns;
-			return false;
-		}
-		const auto requirements = graphics.device.getBufferMemoryRequirements(m_buffer);
-		const auto wanted = vk::MemoryPropertyFlagBits::eHostVisible |
-		                    vk::MemoryPropertyFlagBits::eHostCoherent;
-		const auto& memory = graphics.GetPhysicalDeviceMemoryProperties();
-		bool        bound  = false;
-		for (uint32_t type = 0; type < memory.memoryTypeCount; type++) {
-			const auto flags = memory.memoryTypes[type].propertyFlags;
-			if ((requirements.memoryTypeBits & (1u << type)) == 0 || (flags & wanted) != wanted) {
-				continue;
-			}
-			vk::MemoryAllocateInfo allocate {};
-			allocate.allocationSize  = requirements.size;
-			allocate.memoryTypeIndex = type;
-			if (graphics.device.allocateMemory(&allocate, nullptr, &m_memory) ==
-			        vk::Result::eSuccess &&
-			    graphics.device.bindBufferMemory(m_buffer, m_memory, 0) == vk::Result::eSuccess) {
-				bound = true;
-				break;
-			}
-			if (m_memory != nullptr) {
-				graphics.device.freeMemory(m_memory, nullptr);
-				m_memory = nullptr;
-			}
-		}
-		if (bound &&
-		    graphics.device.mapMemory(m_memory, 0, VK_WHOLE_SIZE, {}, &m_mapped) ==
-		        vk::Result::eSuccess) {
-			// fall through
-		} else {
-			bound = false;
-		}
-		if (!bound) {
-			if (m_buffer != nullptr) {
-				graphics.device.destroyBuffer(m_buffer, nullptr);
-				m_buffer = nullptr;
-			}
-			if (m_memory != nullptr) {
-				graphics.device.freeMemory(m_memory, nullptr);
-				m_memory = nullptr;
-			}
-			m_next_due_ns = FrameDumpNowNs() + GetFrameDumpSettings().interval_ns;
-			return false;
-		}
-
-		vk::BufferImageCopy region {};
-		region.bufferOffset                    = 0;
-		region.bufferRowLength                 = 0;
-		region.bufferImageHeight               = 0;
-		region.imageSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
-		region.imageSubresource.mipLevel       = 0;
-		region.imageSubresource.baseArrayLayer = 0;
-		region.imageSubresource.layerCount     = 1;
-		region.imageOffset                     = vk::Offset3D {0, 0, 0};
-		region.imageExtent = vk::Extent3D {source.extent.width, source.extent.height, 1};
-		command.copyImageToBuffer(source.image, vk::ImageLayout::eTransferSrcOptimal, m_buffer, 1,
-		                          &region);
-		vk::BufferMemoryBarrier barrier {};
-		barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
-		barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
-		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.buffer              = m_buffer;
-		barrier.offset              = 0;
-		barrier.size                = size;
-		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                        vk::PipelineStageFlagBits::eHost, vk::DependencyFlags {}, 0,
-		                        nullptr, 1, &barrier, 0, nullptr);
-
-		m_width  = source.extent.width;
-		m_height = source.extent.height;
-		m_pixel_format = pixel_format;
-		return true;
-	}
-
-	// Called after the present command buffer that carried the copy has been submitted.
-	void Commit(uint64_t tick) {
-		m_pending      = true;
-		m_pending_tick = tick;
-	}
-
-	void Poll(CommandScheduler& scheduler, const GraphicContext& graphics) {
-		if (!m_pending) {
-			return;
-		}
-		if (!scheduler.IsFree(m_pending_tick)) {
-			return;
-		}
-		if (m_mapped != nullptr) {
-			WritePng();
-		}
-		graphics.device.unmapMemory(m_memory);
-		graphics.device.destroyBuffer(m_buffer, nullptr);
-		graphics.device.freeMemory(m_memory, nullptr);
-		m_buffer              = nullptr;
-		m_memory              = nullptr;
-		m_mapped              = nullptr;
-		m_pending             = false;
-		m_next_due_ns         = FrameDumpNowNs() + GetFrameDumpSettings().interval_ns;
-	}
-
-	// Releases the readback resources during normal teardown. An in-flight copy is left for
-	// device destruction, because waiting on it here could deadlock the shutdown path.
-	void Abandon(const GraphicContext& graphics) {
-		if (m_pending) {
-			return;
-		}
-		if (m_mapped != nullptr) {
-			graphics.device.unmapMemory(m_memory);
-			m_mapped = nullptr;
-		}
-		if (m_buffer != nullptr) {
-			graphics.device.destroyBuffer(m_buffer, nullptr);
-			m_buffer = nullptr;
-		}
-		if (m_memory != nullptr) {
-			graphics.device.freeMemory(m_memory, nullptr);
-			m_memory = nullptr;
-		}
-	}
-
-private:
-	void WritePng() {
-		const auto& settings = GetFrameDumpSettings();
-		const int   width    = static_cast<int>(m_width);
-		const int   height   = static_cast<int>(m_height);
-		int         factor   = 1;
-		if (width > static_cast<int>(settings.max_width)) {
-			factor = (width + static_cast<int>(settings.max_width) - 1) /
-			         static_cast<int>(settings.max_width);
-		}
-		const int out_width  = std::max(width / factor, 1);
-		const int out_height = std::max(height / factor, 1);
-		std::vector<uint8_t> pixels(static_cast<size_t>(out_width) * out_height * 4);
-		const auto*          source = static_cast<const uint8_t*>(m_mapped);
-		for (int y = 0; y < out_height; y++) {
-			const auto* row = source + static_cast<size_t>(y * factor) * width * 4;
-			for (int x = 0; x < out_width; x++) {
-				const auto* in = row + static_cast<size_t>(x * factor) * 4;
-				auto*       out = pixels.data() + (static_cast<size_t>(y) * out_width + x) * 4;
-				switch (m_pixel_format) {
-					case FrameDumpPixelFormat::Rgba8:
-						out[0] = in[0];
-						out[1] = in[1];
-						out[2] = in[2];
-						out[3] = in[3];
-						break;
-					case FrameDumpPixelFormat::Bgra8:
-						out[0] = in[2];
-						out[1] = in[1];
-						out[2] = in[0];
-						out[3] = in[3];
-						break;
-					case FrameDumpPixelFormat::A2R10G10B10: {
-						const uint32_t packed = *reinterpret_cast<const uint32_t*>(in);
-						out[0]                = static_cast<uint8_t>(((packed >> 20u) & 0x3ffu) >> 2u);
-						out[1]                = static_cast<uint8_t>(((packed >> 10u) & 0x3ffu) >> 2u);
-						out[2]                = static_cast<uint8_t>((packed & 0x3ffu) >> 2u);
-						out[3] = static_cast<uint8_t>(((packed >> 30u) & 0x3u) * 85u);
-						break;
-					}
-					case FrameDumpPixelFormat::A2B10G10R10: {
-						const uint32_t packed = *reinterpret_cast<const uint32_t*>(in);
-						out[0]                = static_cast<uint8_t>((packed & 0x3ffu) >> 2u);
-						out[1]                = static_cast<uint8_t>(((packed >> 10u) & 0x3ffu) >> 2u);
-						out[2]                = static_cast<uint8_t>(((packed >> 20u) & 0x3ffu) >> 2u);
-						out[3] = static_cast<uint8_t>(((packed >> 30u) & 0x3u) * 85u);
-						break;
-					}
-					default:
-						out[0] = in[0];
-						out[1] = in[1];
-						out[2] = in[2];
-						out[3] = in[3];
-						break;
-				}
-			}
-		}
-		const auto path = fmt::format("{}/frame_{:06}.png", settings.dir, m_sequence++);
-		if (stbi_write_png(path.c_str(), out_width, out_height, 4, pixels.data(),
-		                   out_width * 4) != 0) {
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "Frame dump: {} {}x{} (source {}x{})\n", path, out_width, out_height, width,
-			    height));
-		}
-	}
-
-	vk::Buffer       m_buffer         = nullptr;
-	vk::DeviceMemory m_memory         = nullptr;
-	void*            m_mapped         = nullptr;
-	uint32_t         m_width          = 0;
-	uint32_t         m_height         = 0;
-	FrameDumpPixelFormat m_pixel_format = FrameDumpPixelFormat::Unsupported;
-	uint64_t         m_pending_tick   = 0;
-	uint64_t         m_next_due_ns    = FrameDumpNowNs() + GetFrameDumpSettings().start_ns;
-	uint64_t         m_sequence       = 0;
-	bool             m_pending        = false;
-	bool             m_unsupported_logged = false;
-};
-
-} // namespace
 
 void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format) {
 	if (extent.width == 0 || extent.height == 0 || format == vk::Format::eUndefined) {
@@ -586,7 +268,7 @@ public:
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] bool   NeedsResize() const;
-	[[nodiscard]] Status AcquireNextImage();
+	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
@@ -597,20 +279,31 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
+	bool SetHdr(bool hdr) {
+		const bool changed = m_hdr_active != (hdr && IsHdrSupported());
+		m_hdr_requested = hdr;
+		return changed;
+	}
 
 private:
+	vk::SurfaceFormatKHR SelectFormat();
 	void Destroy();
 	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer);
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
 	vk::Format       m_format = vk::Format::eUndefined;
+	std::atomic_bool m_hdr_supported {false};
+	bool             m_hdr_requested = false;
+	bool             m_hdr_active    = false;
 	vk::Extent2D     m_extent {};
 	// Drawable pixel size observed when this swapchain was created.
 	vk::Extent2D                   m_window_extent {};
 	std::vector<vk::Image>         m_images;
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
+	std::vector<uint64_t>          m_image_acquired_ticks;
 	std::vector<vk::Semaphore>     m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
 	vk::DescriptorSetLayout        m_overlay_descriptors = nullptr;
@@ -629,11 +322,11 @@ struct Presenter::Impl {
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
 	}
-	~Impl() { dumper.Abandon(window.graphic_ctx); }
 
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
 	}
@@ -668,8 +361,41 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
-	FrameDumper           dumper;
 };
+
+vk::SurfaceFormatKHR Swapchain::SelectFormat() {
+	const auto& formats    = m_window.surface_capabilities.formats;
+	auto&       graphics   = m_window.graphic_ctx;
+	const auto  hdr_format = std::ranges::find_if(formats, [&](const auto& candidate) {
+		return candidate.colorSpace == vk::ColorSpaceKHR::eHdr10St2084EXT &&
+		       IsHdrSwapchainFormat(candidate.format) &&
+		       static_cast<bool>(
+		           graphics.GetFormatProperties(candidate.format).optimalTilingFeatures &
+		           vk::FormatFeatureFlagBits::eBlitDst);
+	});
+	m_hdr_supported        = Config::HdrEnabled() && hdr_format != formats.end();
+	m_hdr_active           = m_hdr_requested && IsHdrSupported();
+	if (m_hdr_active) {
+		return *hdr_format;
+	}
+	if (Config::HdrEnabled() && !IsHdrSupported()) {
+		LOGF("HDR10 surface unavailable; using SDR output\n");
+	}
+	if (formats.size() == 1 && formats.front().format == vk::Format::eUndefined) {
+		return {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
+	}
+	for (const auto& candidate: formats) {
+		if (candidate.colorSpace != vk::ColorSpaceKHR::eSrgbNonlinear) {
+			continue;
+		}
+		switch (candidate.format) {
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eR8G8B8A8Unorm: return candidate;
+			default: break;
+		}
+	}
+	EXIT("no supported UNORM swapchain format\n");
+}
 
 void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
@@ -710,18 +436,7 @@ void Swapchain::Create() {
 	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
 
-	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
-	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
-		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
-		                             [](const vk::SurfaceFormatKHR& candidate) {
-			                             return candidate.format == vk::Format::eB8G8R8A8Unorm ||
-			                                    candidate.format == vk::Format::eR8G8B8A8Unorm;
-		                             });
-		if (it == surface.formats.end()) {
-			EXIT("no supported UNORM swapchain format\n");
-		}
-		format = *it;
-	}
+	const auto format = SelectFormat();
 	m_format                      = format.format;
 	const auto swapchain_features = graphics.GetFormatProperties(m_format).optimalTilingFeatures;
 	if (!static_cast<bool>(swapchain_features & vk::FormatFeatureFlagBits::eBlitDst)) {
@@ -761,6 +476,7 @@ void Swapchain::Create() {
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
 	EXIT_IF(m_handle == nullptr);
+	LOGF("Vulkan presentation: %s\n", m_hdr_active ? "HDR10 (PQ)" : "SDR");
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
@@ -789,6 +505,7 @@ void Swapchain::Create() {
 	vk::SemaphoreCreateInfo semaphore_info {};
 	semaphore_info.sType = vk::StructureType::eSemaphoreCreateInfo;
 	m_image_acquired.resize(m_images.size());
+	m_image_acquired_ticks.assign(m_images.size(), 0);
 	m_render_complete.resize(m_images.size());
 	for (size_t i = 0; i < m_images.size(); i++) {
 		RequireVulkanSuccess(
@@ -857,6 +574,7 @@ void Swapchain::Destroy() {
 	m_images.clear();
 	m_image_views.clear();
 	m_image_acquired.clear();
+	m_image_acquired_ticks.clear();
 	m_render_complete.clear();
 }
 
@@ -882,8 +600,11 @@ bool Swapchain::NeedsResize() const {
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
-Swapchain::Status Swapchain::AcquireNextImage() {
+Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
+	// Repeated frames can wrap the semaphore ring without acquiring a new source frame.
+	// Wait for the submission that consumed this slot before signaling it again.
+	scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
 	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
@@ -1017,9 +738,11 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
 	write.pImageInfo      = &image;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
-	const uint32_t premultiplied = layer.premultiplied_alpha;
+	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) |
+	                       (m_hdr_active ? 2u : 0u) | (frame.hdr ? 4u : 0u) |
+	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u);
 	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
-	                      sizeof(premultiplied), &premultiplied);
+	                      sizeof(flags), &flags);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
 	vk::RenderingAttachmentInfo attachment {};
 	attachment.imageView   = m_image_views[m_image_index];
@@ -1153,7 +876,9 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	return scheduler.Submit(submit);
+	const auto tick                       = scheduler.Submit(submit);
+	m_image_acquired_ticks[m_frame_index] = tick;
+	return tick;
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -1193,7 +918,7 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
@@ -1203,6 +928,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
+	frame->hdr   = hdr;
+	frame->blank = false;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -1219,7 +946,8 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	frame->hdr   = false;
+	frame->blank = true;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1227,6 +955,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
+		Common::LockGuard lock(m_impl->present_mutex);
 		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
 		frame->present_tick = m_impl->present_scheduler.Submit();
@@ -1245,6 +974,10 @@ bool Presenter::PresentLastFrame() {
 
 bool Presenter::IsGuestPaused() const noexcept {
 	return m_impl->window.loop.paused.load(std::memory_order_acquire);
+}
+
+bool Presenter::IsHdrSupported() const noexcept {
+	return m_impl->swapchain.IsHdrSupported();
 }
 
 bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
@@ -1291,41 +1024,32 @@ void Presenter::ClearLayer(int bus) {
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
 
-	// Drain a previous dump before recording a new one. This only polls the scheduler timeline;
-	// it never waits inside the present path.
-	if (dumper.Enabled()) {
-		dumper.Poll(present_scheduler, window.graphic_ctx);
-	}
-
 	const auto overlay_visual = GetSystemOverlayVisualState();
+	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
+	const auto* main_frame = layers[0].frame;
+	const bool hdr_changed = main_frame != nullptr && !main_frame->blank &&
+	                         swapchain.SetHdr(main_frame->hdr);
 	// Some window systems keep presenting an old swapchain after a resize.
-	if (swapchain.NeedsResize()) {
+	if (hdr_changed || swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage();
+		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
 		}
-		{
-			Common::LockGuard render_lock(renderer.GetMutex());
-			auto&             command = present_scheduler.BeginCommand();
-			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
-			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
-			                                draw_system_overlay);
-			const bool dump_scheduled =
-			    layers[0].frame != nullptr && dumper.Due() &&
-			    dumper.Record(command.Handle(), layers[0].frame->image, window.graphic_ctx);
-			const auto tick = swapchain.Submit(present_scheduler);
-			if (dump_scheduled) {
-				dumper.Commit(tick);
-			}
-			for (const auto& layer: layers) {
-				if (layer.frame != nullptr) {
-					layer.frame->present_tick = tick;
-				}
+		// present_mutex owns the prepared frames and this scheduler. Only queue submission
+		// is shared with rendering, and it has its own queue_mutex.
+		auto&      command = present_scheduler.BeginCommand();
+		const bool draw_system_overlay = (overlay_visual.active || PerformanceOverlayEnabled()) &&
+		                                 swapchain.PrepareSystemOverlay();
+		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
+		                                draw_system_overlay);
+		const auto tick = swapchain.Submit(present_scheduler);
+		for (const auto& layer: layers) {
+			if (layer.frame != nullptr) {
+				layer.frame->present_tick = tick;
 			}
 		}
 		status = swapchain.Present();
@@ -1335,10 +1059,11 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.UpdateTitle();
+		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DroppedPresents);
 }
 
 void Presenter::Discard(Frame& frame) {

@@ -1,11 +1,11 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/gpuCrashDiagnostics.h"
 
 #include <array>
 #include <chrono>
@@ -324,10 +324,9 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
+	                                         Common::DebugCounters::Counter::GpuWaitNs);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	if (result == vk::Result::eErrorDeviceLost) {
-		GpuCrashDiagnostics::ReportDeviceLost(m_graphics);
-	}
 	if (result != vk::Result::eSuccess) {
 		EXIT("Vulkan timeline wait failed: %s (%d), requested_tick=%llu known_tick=%llu\n",
 		     vk::to_string(result).c_str(), static_cast<int>(result),

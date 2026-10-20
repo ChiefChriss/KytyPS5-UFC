@@ -48,9 +48,21 @@ def detect_fight(path):
         bars = [fraction((22, 21, 128, 29), green), fraction((272, 21, 378, 29), green)]
         names = [fraction((20, 11, 128, 21), white), fraction((272, 11, 378, 21), white)]
         both_bars = min(bars) > 0.08 and min(names) > 0.015
-        return {'fight_candidate': both_bars or stamina_rows >= 3,
+        # The two-fighter HUD's name banners (red top-left, blue top-right) stay on screen for the
+        # whole fight, while its stamina bars drain to yellow/orange and sit above the green
+        # boxes. Calibrated 2026-10-19 on thrC1/gta1: fight frames red >= 0.015 and
+        # blue >= 0.035, menus, intros and post-fight screens <= 0.009.
+        banner_image = content.resize((400, 225))
+        def banner(box, predicate):
+            pixels = list(banner_image.crop(box).getdata())
+            return sum(predicate(*p) for p in pixels) / max(1, len(pixels))
+        red = lambda r, g, b: r > 140 and g < 70 and b < 80
+        blue = lambda r, g, b: b > 130 and r < 70 and g < 140
+        banners = [banner((20, 7, 120, 17), red), banner((280, 7, 380, 17), blue)]
+        name_banners = banners[0] > 0.008 and banners[1] > 0.02
+        return {'fight_candidate': both_bars or name_banners or stamina_rows >= 3,
                 'stamina_fractions': bars, 'name_fractions': names,
-                'player_stamina_rows': stamina_rows}
+                'banner_fractions': banners, 'player_stamina_rows': stamina_rows}
 
 
 class LogTail:

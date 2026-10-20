@@ -70,9 +70,6 @@ public:
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
-	// Created for a BDA shader fault: BDA reads never touch the LRU, so the garbage collector
-	// would otherwise retire it while shaders still read it (KYTY_UFC_BDA_KEEP).
-	bool   bda_resident = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
 

@@ -19,7 +19,7 @@ public:
 	~FaultManager();
 	KYTY_CLASS_NO_COPY(FaultManager);
 
-	[[nodiscard]] Buffer* GetFaultBuffer();
+	[[nodiscard]] Buffer* GetFaultBuffer() noexcept;
 	void                  ProcessFaultBuffer();
 
 private:

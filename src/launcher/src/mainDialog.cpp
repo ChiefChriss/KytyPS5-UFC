@@ -1,11 +1,12 @@
 #include "mainDialog.h"
 
+#include "cheatFile.h"
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
-#include "controllerLightbar.h"
+#include "controllerPreview.h"
 #include "gameContent.h"
-#include "patchesDialog.h"
+#include "titleSound.h"
 #include "updateChecker.h"
 #include "kytyGitVersion.h"
 
@@ -90,7 +91,8 @@ private:
 	Ui::MainDialog* m_ui             = {nullptr};
 	MainDialog*     m_main_dialog    = nullptr;
 	UpdateChecker*  m_update_checker = nullptr;
-	ControllerLightbar m_lightbar;
+	ControllerPreview m_controller_preview;
+	TitleSound      m_title_sound;
 	QString         m_interpreter;
 
 	QProcess m_process;
@@ -117,6 +119,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	    QStringLiteral("KytyPS5 | %1%2 | Built %3 %4")
 	        .arg(QString::fromLatin1(KYTY_BUILD_ITERATION_LABEL), QString::fromLatin1(KYTY_GIT_HASH),
 	             QString::fromLatin1(__DATE__), QString::fromLatin1(__TIME__)));
+	m_ui->widget->SetControllerPreview(&m_controller_preview);
 
 	m_main_dialog = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);
@@ -128,11 +131,17 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
-	connect(m_ui->widget, &ConfigurationListWidget::Select, this, &MainDialogPrivate::Update);
+	connect(m_ui->widget, &ConfigurationListWidget::Select, this, [this]() {
+		Update();
+		const auto* item = m_ui->widget->GetSelectedItem();
+		m_title_sound.SetTitle(m_process.state() == QProcess::NotRunning && item != nullptr
+		                           ? item->GetInfo().basedir
+		                           : QString());
+	});
 	connect(m_ui->widget, &ConfigurationListWidget::PreviewControllerColor, this,
 	        [this](const QString& color) {
 		        if (m_process.state() == QProcess::NotRunning) {
-			        m_lightbar.SetColor(color);
+			        m_controller_preview.SetColor(color);
 		        }
 	        });
 	connect(m_ui->widget, &ConfigurationListWidget::Run, this, &MainDialogPrivate::Run);
@@ -140,6 +149,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	        [this](const QString&) { m_update_checker->Check(true); });
 	connect(m_update_checker, &UpdateChecker::CheckingChanged, m_ui->check_updates_link,
 	        &QLabel::setDisabled);
+	connect(m_update_checker, &UpdateChecker::InstallingChanged, this, &MainDialogPrivate::Update);
 	connect(m_ui->check_updates_on_startup, &QCheckBox::toggled, this, [this](bool checked) {
 		g_check_updates_on_startup = checked;
 		m_ui->widget->WriteSettings();
@@ -150,6 +160,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	});
 
 	connect(&m_process, &QProcess::stateChanged, this, [this](QProcess::ProcessState state) {
+		m_update_checker->SetGameRunning(state != QProcess::NotRunning);
 		if (state == QProcess::NotRunning) {
 			if (m_running_item != nullptr) {
 				m_running_item->SetRunning(false);
@@ -166,6 +177,7 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 }
 
 void MainDialogPrivate::FindInterpreter() {
+	UpdateChecker::ShowPreviousResult(m_main_dialog);
 	QDir search_dir(QApplication::applicationDirPath());
 	m_interpreter = search_dir.absoluteFilePath(EMULATOR_EXE);
 
@@ -175,6 +187,7 @@ void MainDialogPrivate::FindInterpreter() {
 	}
 
 	bool found = QFile::exists(m_interpreter);
+	m_ui->widget->SetRuntimeDirectory(QFileInfo(m_interpreter).absolutePath());
 
 	if (found) {
 		m_ui->label_Interpreter->setText(tr("Emulator: ") + m_interpreter);
@@ -238,6 +251,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--controller-volume" << QString::number(info.controller.speaker_volume);
 	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
+	args << "--keyboard-player" << QString::number(info.controller.keyboard_player);
 	args << "--present-mode" << EnumToText(info.present_mode);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
@@ -245,10 +259,20 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.fullscreen_enabled) {
 		args << "--fullscreen";
 	}
+	if (info.hdr_enabled) {
+		args << "--hdr";
+	}
 	if (info.hide_cursor_enabled) {
 		args << "--hide-cursor";
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
+	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
+	args << "--support-zmask" << BoolArg(info.support_zmask);
+	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
+	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
+	args << "--perf-overlay" << BoolArg(info.perf_overlay_enabled);
+	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
+	args << "--network-connected" << BoolArg(info.network_connected);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}
@@ -287,8 +311,11 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		game = QDir(info.basedir).filePath(info.elf);
 	}
 	args << "--game" << game;
+	if (!info.addons_dir.isEmpty()) {
+		args << "--addcont-dir" << info.addons_dir;
+	}
 
-	const auto patch_plan = PatchesDialog::PatchPlanPath(info.title_id);
+	const auto patch_plan = Cheats::PlanPath(info.title_id);
 	if (QFileInfo::exists(patch_plan)) {
 		args << "--game-patch" << patch_plan;
 	}
@@ -509,13 +536,17 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 }
 
 void MainDialogPrivate::Run() {
+	if (m_update_checker->IsInstalling()) {
+		return;
+	}
 	m_running_item = m_ui->widget->GetSelectedItem();
 	if (m_running_item == nullptr) {
 		return;
 	}
 
 	m_running_item->SetRunning(true);
-	m_lightbar.Stop();
+	m_controller_preview.SetSuspended(true);
+	m_title_sound.SetTitle({});
 
 	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
 	m_main_dialog->RunInterpreter(&m_process, *info);
@@ -526,7 +557,8 @@ void MainDialogPrivate::Run() {
 void MainDialogPrivate::Update() {
 	const auto* item = m_ui->widget->GetSelectedItem();
 
-	bool run_enabled = (m_process.state() == QProcess::NotRunning && item != nullptr);
+	bool run_enabled = (m_process.state() == QProcess::NotRunning && item != nullptr &&
+	                    !m_update_checker->IsInstalling());
 
 	if (run_enabled) {
 		const auto& info = item->GetInfo();
@@ -536,10 +568,11 @@ void MainDialogPrivate::Update() {
 
 	m_ui->widget->SetRunEnabled(run_enabled);
 	if (m_process.state() != QProcess::NotRunning) {
-		m_lightbar.Stop();
+		m_controller_preview.SetSuspended(true);
 		return;
 	}
-	m_lightbar.SetColor(m_ui->widget->GetGlobalControllerColor());
+	m_controller_preview.SetSuspended(false);
+	m_controller_preview.SetColor(m_ui->widget->GetGlobalControllerColor());
 }
 
 #include "mainDialog.moc"

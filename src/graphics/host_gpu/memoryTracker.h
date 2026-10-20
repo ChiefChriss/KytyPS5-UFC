@@ -7,7 +7,6 @@
 #include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -25,26 +24,15 @@ public:
 	KYTY_CLASS_NO_COPY(MemoryTracker);
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
-	// Like IsRegionCpuModified, but never creates a tracking region (a new region starts fully
-	// CPU-dirty and bumps the generation). Use for side-effect-free diagnostics/oracles.
-	[[nodiscard]] bool IsRegionCpuModifiedExisting(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
-	// Monotonic counter bumped on every CPU-dirty transition (and every region creation). A
-	// consumer may skip re-scanning for uploads while this value is unchanged, which stays
-	// correct even when an individual dirty-log entry is lost: any transition forces a scan.
-	[[nodiscard]] uint64_t CpuDirtyGeneration() const noexcept {
-		return m_cpu_dirty_generation.load(std::memory_order_acquire);
-	}
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
-	// Moves the full tracker-page footprints that became CPU-dirty into `ranges`. Returns false
-	// when the log overflowed; every tracked range must then be treated as possibly dirty.
-	[[nodiscard]] bool TakeCpuDirtyRanges(std::vector<GuestRange>& ranges);
-	// True when the not-yet-taken CPU-dirty log covers part of [vaddr, vaddr + size) or has
-	// overflowed (diagnostics: separates a racing fault from a missed log entry).
-	[[nodiscard]] bool CpuDirtyLogIntersects(uint64_t vaddr, uint64_t size);
+	// Queue after changing ownership; a concurrent drain must not consume an event
+	// before the dirty pages it describes become visible.
+	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] RangeSet TakeBdaSync();
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -61,14 +49,13 @@ public:
 					return true;
 				}
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
-				// Log under the region lock: a page seen CPU-dirty is always logged or taken.
-				RecordCpuDirty(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();
 			if (should_flush) {
 				on_flush();
 			}
 		});
+		QueueBdaSync(vaddr, size);
 	}
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -100,9 +87,8 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
-		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
-		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
@@ -123,12 +109,8 @@ public:
 	}
 
 private:
-	static constexpr size_t REGION_COUNT       = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
-	static constexpr size_t CPU_DIRTY_LOG_SIZE = 256;
+	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
-
-	// Called after the CPU-dirty bits are set; may run in the page-fault handler.
-	void RecordCpuDirty(uint64_t vaddr, uint64_t size) noexcept;
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {
@@ -172,12 +154,9 @@ private:
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
+	std::mutex                                     m_bda_sync_mutex;
+	RangeSet                                       m_bda_sync;
 	PageManager&                                   m_page_manager;
-	TrackingSpinLock                               m_cpu_dirty_lock;
-	std::atomic<uint64_t>                          m_cpu_dirty_generation {1};
-	std::array<GuestRange, CPU_DIRTY_LOG_SIZE>     m_cpu_dirty_log {};
-	size_t                                         m_cpu_dirty_count    = 0;
-	bool                                           m_cpu_dirty_overflow = true;
 };
 
 } // namespace Libs::Graphics

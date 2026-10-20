@@ -23,6 +23,12 @@ enum class ContextStateOperation : uint32_t {
 	PushClear = 3,
 };
 
+struct IndirectDrawRegisters {
+	uint32_t vertex_offset;
+	uint32_t instance_offset;
+	uint32_t index_offset;
+};
+
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
@@ -79,12 +85,11 @@ public:
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
-	// BASE_VTX_LOC / START_INST_LOC of the indirect-draw packet about to execute.
-	void SetIndirectOffsetLocs(uint32_t base_vtx_loc, uint32_t start_inst_loc);
-	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
+	void DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
+	                  uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
-	                       uint32_t draw_initiator, bool indexed);
+	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
 	void WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint32_t value,
@@ -143,9 +148,6 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
-	friend struct CommandProcessorTestAccess;
-	// Shared single-element path; a multi-draw address must not be truncated to a DWORD offset.
-	[[nodiscard]] bool DrawIndirectAt(uint64_t args_vaddr, bool indexed);
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
@@ -168,16 +170,8 @@ private:
 	uint64_t         m_index_base_addr                  = 0;
 	uint64_t         m_draw_indirect_args_base_addr     = 0;
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
-	// Persistent draw state: indirect draws update it for subsequent draws. A GPU-sourced
-	// indirect draw leaves the value unknown until a later draw needs it; the producing
-	// arguments are then read (host copy when available, drained guest memory otherwise).
-	// The pending size matches the argument layout (16 non-indexed, 20 indexed); the
-	// instance count sits at the same offset in both, so either size reads it correctly.
-	uint32_t m_num_instances           = 1;
-	bool     m_num_instances_pending   = false;
-	uint64_t m_num_instances_args      = 0;
-	uint64_t m_num_instances_args_size = 0;
-	uint32_t ResolveNumInstances();
+	// Persistent draw state: indirect draws update it for subsequent draws.
+	uint32_t m_num_instances = 1;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

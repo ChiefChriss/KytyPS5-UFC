@@ -2,8 +2,8 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 
+#include <algorithm>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -18,23 +18,89 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
-	// Optional: bit i set when user_data[i] was read (bit 63: an index >= 63 was read).
-	uint64_t*                 user_data_reads            = nullptr;
+	std::span<const uint32_t> workgroup_counts;
+	uint64_t                  indirect_args_address = 0;
 };
 
-enum class RuntimeValueType { Any, Integer };
+class SrtReadCapture {
+public:
+	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
+	    m_source(source), m_ranges(ranges) {}
+	SrtRuntime ObservedRuntime();
+
+private:
+	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
+	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values);
+
+	SrtRuntime                                  m_source;
+	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
+};
+
+// Retained reads no longer need the guest instruction PC. A clean read evaluates
+// its address and bounds through the strict reader as well as the final DWORD.
+struct SrtReadFlags {
+	uint32_t index = 0;
+	uint32_t clean = 0;
+};
+
+enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
+// Uniform across a compute wave, including values derived from its workgroup ID.
+// This does not imply that the host can evaluate the value.
+bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
+void CompileSrtWalker(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
+
+// Nonnegative affine coefficients: element zero is constant, remaining elements are
+// caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
+template <size_t Size>
+std::optional<std::array<uint64_t, Size>> AffineIndex(
+    Value value, const auto& resolve, const auto& leaf, uint32_t depth = 0) {
+	value = resolve(value);
+	if (depth > 32u || value.GetType() != Type::U32) return {};
+	std::array<uint64_t, Size> result {};
+	if (value.IsImmediate()) {
+		result[0] = value.U32();
+		return result;
+	}
+	if (const auto index = leaf(value)) {
+		result[*index] = 1u;
+		return result;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) return {};
+	const auto op = inst->GetOpcode();
+	if (op != ValueOpcode::IAdd32 && op != ValueOpcode::IMul32 &&
+	    op != ValueOpcode::ShiftLeftLogical32) return {};
+	auto left = AffineIndex<Size>(inst->Arg(0), resolve, leaf, depth + 1u);
+	auto right = AffineIndex<Size>(inst->Arg(1), resolve, leaf, depth + 1u);
+	if (!left || !right) return {};
+	const auto constant = [](const auto& coefficients) {
+		return std::ranges::all_of(std::span(coefficients).subspan(1u),
+		                          [](uint64_t coefficient) { return coefficient == 0u; });
+	};
+	if (op == ValueOpcode::IMul32 && !constant(*right)) std::swap(left, right);
+	if (op != ValueOpcode::IAdd32 && !constant(*right)) return {};
+	if (op == ValueOpcode::ShiftLeftLogical32) {
+		if ((*right)[0] >= 32u) return {};
+		(*right)[0] = uint64_t {1} << (*right)[0];
+	}
+	for (size_t index = 0; index < Size; ++index) {
+		(*left)[index] = op == ValueOpcode::IAdd32
+		    ? (*left)[index] + (*right)[index] : (*left)[index] * (*right)[0];
+		if ((*left)[index] > UINT32_MAX) return {};
+	}
+	return left;
+}
 
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
 public:
 	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
-	          std::span<const uint8_t> clean_flat_slots = {}, SrtWalker* clean_evaluator = nullptr,
-	          Value active_mask = {});
+	          SrtWalker* clean_evaluator = nullptr);
 	~SrtWalker();
 	SrtWalker(const SrtWalker&)            = delete;
 	SrtWalker& operator=(const SrtWalker&) = delete;
@@ -45,11 +111,10 @@ public:
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:
-	friend struct SrtNativeHelpers;
-	friend struct SrtNativeTestAccess;
-	void BindNative();
-	bool VerifyNative(Value value, bool ok, uint64_t result);
-	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
+	SrtWalker(SrtWalker& parent, Value active_mask, bool clean = false,
+	          SrtWalker* clean_evaluator = nullptr);
+	ResourcePlan::EvaluationContext& AcquireContext();
+	void ResetUnknowns();
 	static float Float32(uint64_t bits);
 	bool EvaluateWide(Value value, uint64_t& result);
 	bool Arg(const Inst& inst, size_t index, uint64_t& result);
@@ -60,14 +125,12 @@ private:
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
-	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	const std::vector<uint8_t>*      m_reachable_blocks = nullptr;
+	const SrtWalker*                m_session;
+	uint8_t                         m_read_policy;
 	ResourcePlan::EvaluationContext& m_context;
-	SrtNativeCode* m_native = nullptr;
-	SrtNativeMode m_native_mode = SrtNativeMode::Self;
-	SrtNativeFrame m_native_frame;
-	const Inst* m_failed_value = nullptr;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

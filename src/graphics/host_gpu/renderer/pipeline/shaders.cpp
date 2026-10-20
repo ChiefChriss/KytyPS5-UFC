@@ -18,8 +18,9 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
-#include <chrono>
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <limits>
 #include <span>
 #include <vector>
@@ -138,17 +139,14 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 	}
 }
 
-static vk::BlendFactor GetBlendFactor(uint32_t factor, bool remap_source_alpha) {
+static vk::BlendFactor GetBlendFactor(uint32_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 		case Prospero::BlendFactor::kZero: return vk::BlendFactor::eZero;
 		case Prospero::BlendFactor::kOne: return vk::BlendFactor::eOne;
 		case Prospero::BlendFactor::kSrcColor: return vk::BlendFactor::eSrcColor;
 		case Prospero::BlendFactor::kOneMinusSrcColor: return vk::BlendFactor::eOneMinusSrcColor;
-		case Prospero::BlendFactor::kSrcAlpha:
-			return remap_source_alpha ? vk::BlendFactor::eSrc1Color : vk::BlendFactor::eSrcAlpha;
-		case Prospero::BlendFactor::kOneMinusSrcAlpha:
-			return remap_source_alpha ? vk::BlendFactor::eOneMinusSrc1Color
-			                          : vk::BlendFactor::eOneMinusSrcAlpha;
+		case Prospero::BlendFactor::kSrcAlpha: return vk::BlendFactor::eSrcAlpha;
+		case Prospero::BlendFactor::kOneMinusSrcAlpha: return vk::BlendFactor::eOneMinusSrcAlpha;
 		case Prospero::BlendFactor::kDstAlpha: return vk::BlendFactor::eDstAlpha;
 		case Prospero::BlendFactor::kOneMinusDstAlpha: return vk::BlendFactor::eOneMinusDstAlpha;
 		case Prospero::BlendFactor::kDstColor: return vk::BlendFactor::eDstColor;
@@ -181,21 +179,44 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 	return vk::BlendOp::eAdd;
 }
 
-static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>&    descriptor_bindings,
+static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                              vk::ShaderStageFlagBits                         stage) {
-	for (const auto& binding: program.bindings.descriptors) {
+                              vk::ShaderStageFlagBits              stage) {
+	for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
+		const auto index = std::countr_zero(mask);
+		const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
 		descriptor_bindings.push_back(
-		    {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
-		     NativeDescriptorType(binding.kind), NativeDescriptorCount(binding), stage, nullptr});
+		    {ShaderRecompiler::IR::NativeBinding(program.stage, kind), NativeDescriptorType(kind),
+		     program.bindings.descriptor_counts[index], stage, nullptr});
 	}
 }
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	uint32_t descriptor_count = 0;
+	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
+	uint64_t descriptor_count = 0;
+	uint64_t storage_buffers = 0;
+	std::array<uint64_t, 32> stage_buffers {}, stage_resources {};
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
+		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer;
+		if (storage) storage_buffers += binding.descriptorCount;
+		for (auto stages = static_cast<uint32_t>(binding.stageFlags); stages != 0; stages &= stages - 1u) {
+			const auto stage = std::countr_zero(stages);
+			if (storage) stage_buffers[stage] += binding.descriptorCount;
+			if (binding.descriptorType != vk::DescriptorType::eSampler)
+				stage_resources[stage] += binding.descriptorCount;
+			if (stage_buffers[stage] > limits.maxPerStageDescriptorStorageBuffers ||
+			    stage_resources[stage] > limits.maxPerStageResources) {
+				EXIT("native descriptor stage %u exceeds device limits: buffers=%" PRIu64
+				     "/%u resources=%" PRIu64 "/%u\n", stage, stage_buffers[stage],
+				     limits.maxPerStageDescriptorStorageBuffers, stage_resources[stage], limits.maxPerStageResources);
+			}
+		}
+	}
+	if (storage_buffers > limits.maxDescriptorSetStorageBuffers) {
+		EXIT("native storage-buffer descriptors exceed device limit: %" PRIu64 "/%u\n",
+		     storage_buffers, limits.maxDescriptorSetStorageBuffers);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
 
@@ -222,7 +243,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
 	const bool  tessellation   = vertex_info.size() == 3;
-	const bool  ps_active      = ps_input_info != nullptr;
+	const bool ps_active = ps_input_info != nullptr;
 	EXIT_IF(!vertex_program || (ps_active && !pixel_program));
 	const bool with_depth = rendering.depth_format != vk::Format::eUndefined ||
 	                        rendering.stencil_format != vk::Format::eUndefined;
@@ -371,22 +392,21 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 #if !defined(__APPLE__)
 	// The DB clamps depth to the viewport range after polygon offset is applied.
 	rasterizer.depthClampEnable = VK_TRUE;
-	rasterizer.pNext            = &clip_ext;
+	rasterizer.pNext = &clip_ext;
 #endif
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};
 	EXIT_NOT_IMPLEMENTED(static_params.provoking_vtx_last &&
 	                     !graphics.provoking_vertex_last_enabled);
 	if (graphics.provoking_vertex_last_enabled) {
 		provoking_vertex.provokingVertexMode = static_params.provoking_vtx_last
-		                                           ? vk::ProvokingVertexModeEXT::eLastVertex
-		                                           : vk::ProvokingVertexModeEXT::eFirstVertex;
-		provoking_vertex.pNext               = rasterizer.pNext;
-		rasterizer.pNext                     = &provoking_vertex;
+		    ? vk::ProvokingVertexModeEXT::eLastVertex : vk::ProvokingVertexModeEXT::eFirstVertex;
+		provoking_vertex.pNext = rasterizer.pNext;
+		rasterizer.pNext = &provoking_vertex;
 	}
-	rasterizer.cullMode    = cull_mode;
-	rasterizer.frontFace   = front_face;
+	rasterizer.cullMode  = cull_mode;
+	rasterizer.frontFace = front_face;
 	rasterizer.polygonMode = static_params.polygon_mode;
-	rasterizer.lineWidth   = 1.0f;
+	rasterizer.lineWidth = 1.0f;
 
 	vk::PipelineMultisampleStateCreateInfo multisampling {};
 	multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
@@ -399,20 +419,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		color_blend_attachment[i].colorWriteMask =
 		    vk::ColorComponentFlags {static_params.color_mask[i]};
 		color_blend_attachment[i].blendEnable = static_params.blend_enable[i] ? VK_TRUE : VK_FALSE;
-		// Only target 0 can use the second blend source carrying logical alpha.
-		const bool remap_source_alpha = i == 0 && static_params.blend_alpha_source_remap;
 		color_blend_attachment[i].srcColorBlendFactor =
-		    GetBlendFactor(static_params.color_srcblend[i], remap_source_alpha);
+		    GetBlendFactor(static_params.color_srcblend[i]);
 		color_blend_attachment[i].dstColorBlendFactor =
-		    GetBlendFactor(static_params.color_destblend[i], remap_source_alpha);
+		    GetBlendFactor(static_params.color_destblend[i]);
 		color_blend_attachment[i].colorBlendOp = GetBlendOp(static_params.color_comb_fcn[i]);
 		color_blend_attachment[i].srcAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
-		         ? GetBlendFactor(static_params.alpha_srcblend[i], remap_source_alpha)
+		         ? GetBlendFactor(static_params.alpha_srcblend[i])
 		         : color_blend_attachment[i].srcColorBlendFactor);
 		color_blend_attachment[i].dstAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
-		         ? GetBlendFactor(static_params.alpha_destblend[i], remap_source_alpha)
+		         ? GetBlendFactor(static_params.alpha_destblend[i])
 		         : color_blend_attachment[i].dstColorBlendFactor);
 		color_blend_attachment[i].alphaBlendOp =
 		    (static_params.separate_alpha_blend[i] ? GetBlendOp(static_params.alpha_comb_fcn[i])
@@ -478,25 +496,26 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
-	depth_stencil_info.depthBoundsTestEnable =
-#if defined(__APPLE__)
-	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
-#else
-	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
-#endif
-	depth_stencil_info.minDepthBounds = static_params.depth_min_bounds;
-	depth_stencil_info.maxDepthBounds = static_params.depth_max_bounds;
 
 	std::vector<vk::DynamicState> dynamic_states {
-	    vk::DynamicState::eViewportWithCount,  vk::DynamicState::eScissorWithCount,
-	    vk::DynamicState::eLineWidth,          vk::DynamicState::eDepthTestEnable,
-	    vk::DynamicState::eDepthWriteEnable,   vk::DynamicState::eDepthCompareOp,
-	    vk::DynamicState::eDepthBiasEnable,    vk::DynamicState::eDepthBias,
-	    vk::DynamicState::eStencilTestEnable,  vk::DynamicState::eStencilOp,
-	    vk::DynamicState::eStencilCompareMask, vk::DynamicState::eStencilReference,
-	    vk::DynamicState::eStencilWriteMask,   vk::DynamicState::eBlendConstants,
+	    vk::DynamicState::eViewportWithCount,
+	    vk::DynamicState::eScissorWithCount,
+	    vk::DynamicState::eLineWidth,
+	    vk::DynamicState::eDepthTestEnable,
+	    vk::DynamicState::eDepthWriteEnable,
+	    vk::DynamicState::eDepthCompareOp,
+	    vk::DynamicState::eDepthBiasEnable,
+	    vk::DynamicState::eDepthBias,
+	    vk::DynamicState::eStencilTestEnable,
+	    vk::DynamicState::eStencilOp,
+	    vk::DynamicState::eStencilCompareMask,
+	    vk::DynamicState::eStencilReference,
+	    vk::DynamicState::eStencilWriteMask,
+	    vk::DynamicState::eBlendConstants,
 	};
 #if !defined(__APPLE__)
+	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 	if (rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
@@ -523,15 +542,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
 	tessellation_state.patchControlPoints =
 	    tessellation ? vs_input_info.tess.input_control_points : 3u;
-	pipeline_info.pTessellationState  = (rect_list || tessellation) ? &tessellation_state : nullptr;
-	pipeline_info.pViewportState      = &viewport_state;
-	pipeline_info.pRasterizationState = &rasterizer;
-	pipeline_info.pMultisampleState   = &multisampling;
-	pipeline_info.pDepthStencilState  = (with_depth ? &depth_stencil_info : nullptr);
-	pipeline_info.pColorBlendState    = &color_blending;
-	pipeline_info.pDynamicState       = &dynamic_state;
-	pipeline_info.layout              = pipeline.pipeline_layout;
-	pipeline_info.basePipelineIndex   = -1;
+	pipeline_info.pTessellationState = (rect_list || tessellation) ? &tessellation_state : nullptr;
+	pipeline_info.pViewportState          = &viewport_state;
+	pipeline_info.pRasterizationState     = &rasterizer;
+	pipeline_info.pMultisampleState       = &multisampling;
+	pipeline_info.pDepthStencilState      = (with_depth ? &depth_stencil_info : nullptr);
+	pipeline_info.pColorBlendState        = &color_blending;
+	pipeline_info.pDynamicState           = &dynamic_state;
+	pipeline_info.layout                  = pipeline.pipeline_layout;
+	pipeline_info.basePipelineIndex       = -1;
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
@@ -544,13 +563,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
-	const auto pipeline_begin = std::chrono::steady_clock::now();
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
-	NotePipelineBuildNs(static_cast<uint64_t>(
-	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-	                                                         pipeline_begin)
-	        .count()));
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -580,8 +594,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
 	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled && wave_size >= graphics.min_subgroup_size &&
-	    wave_size <= graphics.max_subgroup_size) {
+	if (graphics.compute_subgroup_size_control_enabled &&
+	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
@@ -601,9 +615,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n", 1u);
+	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
+	     1u);
 	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                   &pipeline.pipeline_layout);
+	                                                  &pipeline.pipeline_layout);
 	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
@@ -619,13 +634,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
-	const auto pipeline_begin = std::chrono::steady_clock::now();
-	result =
-	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
-	NotePipelineBuildNs(static_cast<uint64_t>(
-	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-	                                                         pipeline_begin)
-	        .count()));
+	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
+	                                                &pipeline.pipeline);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

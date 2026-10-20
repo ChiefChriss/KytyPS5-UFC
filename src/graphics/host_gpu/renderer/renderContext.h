@@ -11,7 +11,6 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
-#include "graphics/host_gpu/renderer/nanTraceSnapshot.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
@@ -51,8 +50,7 @@ public:
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
-	// Bytes of [vaddr, vaddr + size) inside GPU-mapped ranges; with `invalidate`, those parts are
-	// treated as CPU-written (GPU-owned data flushed, buffers/images marked CPU-modified).
+	// Invalidate only the mapped intersections of a possibly straddling host write.
 	uint64_t InvalidateMappedOverlap(uint64_t vaddr, uint64_t size, bool invalidate);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
@@ -82,14 +80,10 @@ private:
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
-	uint64_t                  m_mapped_ranges_version = 0;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
-	std::unique_ptr<Buffer>   m_nan_trace_buffer; // KYTY_UFC_NAN_TRACE=1 only
-	std::unique_ptr<NanTraceSnapshot> m_nan_trace_snapshot;
-	uint64_t                  m_nan_trace_frame = UINT64_MAX;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

@@ -6,13 +6,11 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
 #include <bit>
 #include <cinttypes>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -71,24 +69,14 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	SetVulkanObjectNameF(m_graphics.device, m_fault_process_pipeline, "Fault Buffer Parser");
 }
 
-// The fault bitmap is device-local and was never cleared, so whatever the allocation held was
-// reported as faults on the first pass. Zeroed once before its first use; set
-// KYTY_UFC_FAULT_BUFFER_INIT=0 to restore the old behavior.
 void FaultManager::EnsureFaultBufferInitialized() {
-	if (m_fault_buffer_initialized) {
-		return;
-	}
-	m_fault_buffer_initialized = true;
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_UFC_FAULT_BUFFER_INIT");
-		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
-	if (enabled) {
+	if (!m_fault_buffer_initialized) {
 		m_fault_buffer.Fill(0, m_fault_buffer.Size(), 0);
+		m_fault_buffer_initialized = true;
 	}
 }
 
-Buffer* FaultManager::GetFaultBuffer() {
+Buffer* FaultManager::GetFaultBuffer() noexcept {
 	EnsureFaultBufferInitialized();
 	return &m_fault_buffer;
 }
@@ -102,7 +90,6 @@ FaultManager::~FaultManager() {
 void FaultManager::ProcessFaultBuffer() {
 	EnsureFaultBufferInitialized();
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
-		const ScopedWaitSite wait_site(WaitSite::FaultBuffer);
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
 	}
@@ -139,7 +126,7 @@ void FaultManager::ProcessFaultBuffer() {
 	}
 
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Recorder();
+	auto command = m_scheduler.Current().Handle();
 	vk::DependencyInfo dependency {};
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
@@ -159,24 +146,18 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		// The shader counts every attempted store, so the count can exceed the area. Slots
-		// 1..MaxPageFaults-1 hold addresses; pages that did not fit stay in the bitmap and are
-		// reported by the next pass. Never read past this area.
-		const auto  reported = static_cast<uint32_t>(faults[0]);
-		const auto  count    = std::min<uint32_t>(reported, MaxPageFaults - 1);
-		if (reported > count) {
-			LOGF("Fault area full: %u stores attempted, %u processed; the rest are retried\n",
-			     reported, count);
-		}
+		// Slot zero holds the attempted-store count. Only the following
+		// MaxPageFaults-1 addresses fit; the shader retries overflowed bits.
+		const auto reported = static_cast<uint32_t>(faults[0]);
+		const auto count = std::min<uint32_t>(reported, MaxPageFaults - 1);
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
 		}
-		WaitStats::NoteBdaFaults(0, count);
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			m_buffer_cache.HandleBdaFault(start, end - start);
+			(void)m_buffer_cache.FindBuffer(start, end - start);
 		});
 		m_fault_areas[area] = 0;
 	});

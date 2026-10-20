@@ -7,9 +7,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
-#include "graphics/host_gpu/renderer/gpuCheckpointHistory.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/shader/recompiler/NanTrace.h"
 
 #include <array>
 #include <optional>
@@ -37,31 +35,11 @@ class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 
-// Native buffer/offset of guest indirect-draw arguments for a GPU-sourced draw.
-// Non-indexed layout matches VkDrawIndirectCommand (4x u32); indexed layout matches
-// VkDrawIndexedIndirectCommand (5x u32, vertexOffset bit-compatible). The caller guarantees
-// the range is GPU-owned and barriers it for indirect-command reads. Indexed draws also
-// carry the pre-bound index buffer/offset/type (bound at the guest index base address).
-struct GpuIndirectDraw {
-	vk::Buffer    buffer       = nullptr;
-	uint64_t      offset       = 0;
-	bool          indexed      = false;
-	vk::Buffer    index_buffer = nullptr;
-	uint64_t      index_offset = 0;
-	vk::IndexType index_type   = vk::IndexType::eUint16;
-};
-
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
 	DrawIndexAuto,
-	EopWrite,
-	EopInterrupt,
-	EopWriteBack,
-	EopFlip,
-	EopWriteBackFlip,
-	EopOnlyFlip,
-	DispatchIndirect,
+	DispatchIndirect = 9,
 	Unknown,
 };
 
@@ -116,7 +94,6 @@ struct SubmitInfo {
 	}
 };
 
-class CommandRecorder;
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -126,22 +103,16 @@ public:
 	[[nodiscard]] bool IsInvalid() const;
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
-	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0,
-	                  const GpuCrashDiagnostics::GraphicsShaderIdentity& graphics_shaders = {});
+	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
-	[[nodiscard]] CommandRecorder Recorder() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
-	[[nodiscard]] ShaderRecompiler::NanTrace::EventInfo TraceEventInfo() const noexcept {
-		return {.submit = m_debug_submit_id, .address = m_debug_arg4, .op = m_debug_op,
-		        .args = {m_debug_arg0, m_debug_arg1, m_debug_arg2, m_debug_arg3}};
-	}
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -155,10 +126,8 @@ private:
 	void End() const;
 
 	RenderContext&      m_context;
-	CommandScheduler&   m_scheduler;
 	GraphicContext&     m_graphics;
 	vk::CommandBuffer   m_buffer          = nullptr;
-	bool                m_open            = false;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
 	uint32_t            m_debug_arg0      = 0;
@@ -181,43 +150,21 @@ public:
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                      uint32_t mode);
+	                      uint32_t mode, bool async_compute);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void FindBuffers(PreparedBindings& bindings);
-	void RebindBuffers(PreparedBindings& bindings);
-	void RebindImages(PreparedBindings& bindings);
+	void                           FindBuffers(std::span<PreparedBindings* const> stages);
+	void                           RebindBuffers(PreparedBindings& bindings);
+	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
-	                    std::span<PreparedBindings* const> bindings,
-	                    const ShaderClipSpaceTransform*    clip_transform = nullptr);
-	// SGPR locations (BASE_VTX_LOC / START_INST_LOC) of the indirect-draw packet being
-	// executed; indirect draws classify them against the vertex shader (diagnostic counters).
-	void SetIndirectOffsetLocs(uint32_t base_vtx_loc, uint32_t start_inst_loc) noexcept {
-		m_indirect_base_vtx_loc   = base_vtx_loc & 0xffffu;
-		m_indirect_start_inst_loc = start_inst_loc & 0xffffu;
-	}
+	                    std::span<PreparedBindings* const> bindings);
 
 private:
-	void NoteIndirectOffsetLocs(const DrawRenderState& state) const;
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
-	// GPU-sourced non-indexed indirect draw: issues vkCmdDrawIndirect from the given
-	// arguments without reading guest memory. Returns false when the caller must fall back
-	// to the CPU path (unsupported primitive type, mesh shader, arguments unavailable).
-	[[nodiscard]] bool DrawAutoGpuIndirect(uint64_t submit_id, CommandBuffer& buffer,
-	                                      uint64_t args_vaddr, uint32_t render_target_slice_offset);
-	// GPU-sourced indexed indirect draw: issues vkCmdDrawIndexedIndirect from the given
-	// arguments with the index buffer bound at the guest index base. Only the
-	// no-clamp (INDEX_BUFFER_SIZE == 0), 16/32-bit, non-quad, non-mesh, restart-without-scan
-	// subset is served; anything else returns false for the CPU path. 8-bit indices need
-	// CPU expansion and clamped counts need the CPU-visible count.
-	[[nodiscard]] bool DrawIndexGpuIndirect(uint64_t submit_id, CommandBuffer& buffer,
-	                                       uint64_t args_vaddr, uint64_t index_base_addr,
-	                                       uint32_t index_type_and_size, uint32_t index_buffer_size,
-	                                       uint32_t render_target_slice_offset);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -226,46 +173,46 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
-	void                         PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                                                     std::span<RenderColorInfo>         colors);
-	void               ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
-	                                            uint32_t render_target_slice_offset, uint32_t render_target_slot,
-	                                            bool ignore_target_mask = false, bool exact_format = false);
-	void               ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
+	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
+	                             std::span<RenderColorInfo> colors);
+	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
+	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
+	                              bool ignore_target_mask = false, bool exact_format = false);
+	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
-	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                          uint32_t         render_target_slice_offset,
+	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                   const DrawEmitInfo& emit, DrawRenderState& state);
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
+	                                          const DrawCallInfo& draw,
+	                                          uint32_t            render_target_slice_offset,
 	                                          DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	                         bool primitive_restart_enable, const GpuIndirectDraw* indirect = nullptr);
+	                         bool primitive_restart_enable);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
-	                                              uint32_t       render_target_slice_offset);
+	                                              uint32_t render_target_slice_offset);
+	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
+	                                                       uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
-	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                                     const CommandBuffer&          buffer);
-	[[nodiscard]] bool        TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-	                                                      CommandBuffer& command, uint32_t group_x,
-	                                                      uint32_t group_y, uint32_t group_z,
-	                                                      uint32_t mode);
+	void                     UpdateComputeMetaClears(const ShaderComputeInputInfo& input,
+	                                                 const CommandBuffer&          buffer);
+	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
+	                                        CommandBuffer& command, uint32_t group_x,
+	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
-	uint32_t                              m_indirect_base_vtx_loc   = 0x280u;
-	uint32_t                              m_indirect_start_inst_loc = 0x280u;
-	GraphicsBindings                      m_graphics_bindings;
-	PreparedBindings                      m_compute_bindings;
+	GraphicsBindings                     m_graphics_bindings;
+	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
-	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	std::vector<uint32_t>                 m_image_occurrences;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

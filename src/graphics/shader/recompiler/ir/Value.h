@@ -8,9 +8,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
-#include <span>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -23,6 +21,7 @@ class Value {
 public:
 	Value() = default;
 	explicit Value(Inst* value);
+	explicit Value(const Inst* value) = delete;
 	explicit Value(ScalarReg value);
 	explicit Value(VectorReg value);
 	explicit Value(bool value);
@@ -53,8 +52,6 @@ public:
 	[[nodiscard]] uint64_t  U64() const;
 	[[nodiscard]] uint16_t  F16Bits() const;
 	[[nodiscard]] float     F32Value() const;
-	[[nodiscard]] uint64_t ImmediateBits() const;
-	static bool FromImmediateBits(Type type, uint64_t bits, Value& result);
 
 	bool operator==(const Value& other) const;
 
@@ -133,18 +130,18 @@ public:
 		}
 		return evaluation_index;
 	}
+	// Backend definitions belong to one emission. Wave64 emulation needs one per half.
+	[[nodiscard]] uint32_t Definition(uint32_t half) const { return definitions[half]; }
+	void SetDefinition(uint32_t half, uint32_t definition) const {
+		definitions[half] = definition;
+	}
+	void ResetDefinitions() const { definitions = {}; }
 
 	void SetParent(Block* block);
 	void SetArg(size_t index, Value value);
 	void AddPhiOperand(Block* predecessor, Value value);
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
 	void Invalidate();
-	// Senaxx bb7330cc: unlink a group of identities without quadratic use-list erases.
-	void ReplaceUsesForRemoval(Value replacement, const std::unordered_set<const Inst*>& removed,
-	                           std::vector<Inst*>& touched);
-	static void DropRemovedUses(std::span<Inst* const> touched,
-	                            const std::unordered_set<const Inst*>& removed);
-	void DropForDestruction();
 
 	template <typename T>
 	requires(sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>)
@@ -167,8 +164,6 @@ private:
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
-	Value& ArgSlot(size_t index);
-	void ResetArgStorage();
 
 	static constexpr uint8_t InlineArity = 4;
 	static constexpr uint8_t PhiArity = UINT8_MAX;
@@ -177,6 +172,7 @@ private:
 	uint8_t             num_args;
 	bool                live = false;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
+	mutable std::array<uint32_t, 2> definitions {};
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	union {
@@ -187,82 +183,6 @@ private:
 	std::vector<Use>    uses;
 };
 
-static_assert(sizeof(Inst) <= 112, "Inst operand storage unintentionally increased");
-
-// Hot accessors are inline: the SRT walker and the recompiler call them per IR value.
-inline bool Value::IsEmpty() const {
-	return type == Type::Void;
-}
-
-inline bool Value::IsImmediate() const {
-	return type != Type::Opaque;
-}
-
-inline bool Value::IsIdentity() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
-}
-
-inline bool Value::IsPhi() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
-}
-
-inline Inst* Value::TryInstruction() const {
-	return type == Type::Opaque ? inst : nullptr;
-}
-
-inline Inst* Value::ResolveInstruction() const {
-	EXIT_IF(type != Type::Opaque);
-	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
-}
-
-inline Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
-}
-
-inline bool Value::U1() const {
-	EXIT_IF(type != Type::U1);
-	return imm_u1;
-}
-
-inline uint8_t Value::U8() const {
-	EXIT_IF(type != Type::U8);
-	return imm_u8;
-}
-
-inline uint16_t Value::U16() const {
-	EXIT_IF(type != Type::U16);
-	return imm_u16;
-}
-
-inline uint32_t Value::U32() const {
-	EXIT_IF(type != Type::U32);
-	return imm_u32;
-}
-
-inline uint64_t Value::U64() const {
-	EXIT_IF(type != Type::U64);
-	return imm_u64;
-}
-
-inline float Value::F32Value() const {
-	EXIT_IF(type != Type::F32);
-	return std::bit_cast<float>(imm_u32);
-}
-
-inline ValueOpcode Inst::GetOpcode() const {
-	return opcode;
-}
-
-inline size_t Inst::NumArgs() const {
-	return num_args == PhiArity ? phi_args.size() : num_args;
-}
-
-inline Value Inst::Arg(size_t index) const {
-	EXIT_IF(index >= NumArgs());
-	if (num_args <= InlineArity) {
-		return fixed_args[index];
-	}
-	return num_args == PhiArity ? phi_args[index].second : large_args[index];
-}
+static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
